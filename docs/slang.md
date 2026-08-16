@@ -13,14 +13,16 @@ layouts in either shader compilation path described below.
 
 ## Supported Slang version
 
-Use **Slang v2026.14.1 or newer** for the native path.
+Use **Slang v2026.14.1 or newer** for the cube's native descriptor-heap path. The
+pointer-only triangle does not use the new heap input syntax.
 
 Slang v2026.14 added direct `ResourceDescriptorHeap` and
 `SamplerDescriptorHeap` input syntax. The initial v2026.14.0 release had a
 descriptor-heap `ConstantBuffer<T>` lowering bug: it emitted a storage-buffer
 descriptor instead of a uniform-buffer descriptor. That bug was fixed in
 v2026.14.1. The build detects the capability rather than parsing the compiler
-version, so it is the developer's responsibility not to use v2026.14.0.
+version, so it is the developer's responsibility not to use v2026.14.0 for that
+path.
 
 - [Direct descriptor-heap input support](https://github.com/shader-slang/slang/pull/11798)
 - [v2026.14 `ConstantBuffer` issue](https://github.com/shader-slang/slang/issues/12226)
@@ -30,8 +32,7 @@ version, so it is the developer's responsibility not to use v2026.14.0.
 ## Exact compiler options
 
 [`examples/triangle/CMakeLists.txt`](../examples/triangle/CMakeLists.txt) invokes
-the native compiler path equivalently to the following command for the vertex
-entry point:
+the following command for the vertex entry point:
 
 ```sh
 slangc examples/triangle/triangle.slang \
@@ -40,8 +41,6 @@ slangc examples/triangle/triangle.slang \
   -emit-spirv-directly \
   -fvk-use-entrypoint-name \
   -fvk-use-c-layout \
-  -capability spvDescriptorHeapEXT \
-  -DCLEAN_GFX_NATIVE_DESCRIPTOR_HEAP=1 \
   -I examples/triangle \
   -I include \
   -entry vertexMain \
@@ -50,8 +49,31 @@ slangc examples/triangle/triangle.slang \
 ```
 
 The fragment invocation changes the entry point, stage, and output to
-`fragmentMain`, `fragment`, and `triangle.frag.spv`; the compute invocation uses
-`computeMain`, `compute`, and `triangle.comp.spv`.
+`fragmentMain`, `fragment`, and `triangle.frag.spv`. The minimal triangle has no
+compute stage and no descriptor-heap access, so its compiler command requests no
+descriptor-heap capability. Its root contains only a typed BDA pointer.
+
+[`examples/cube/CMakeLists.txt`](../examples/cube/CMakeLists.txt) adds the native
+descriptor-heap options to otherwise equivalent vertex and fragment commands:
+
+```sh
+slangc examples/cube/cube.slang \
+  -target spirv \
+  -profile spirv_1_6 \
+  -emit-spirv-directly \
+  -fvk-use-entrypoint-name \
+  -fvk-use-c-layout \
+  -capability spvDescriptorHeapEXT \
+  -DCLEAN_GFX_NATIVE_DESCRIPTOR_HEAP=1 \
+  -I examples/cube \
+  -I include \
+  -entry fragmentMain \
+  -stage fragment \
+  -o cube.frag.spv
+```
+
+The cube vertex invocation changes the entry point, stage, and output to
+`vertexMain`, `vertex`, and `cube.vert.spv`.
 
 The significant options are:
 
@@ -62,11 +84,11 @@ The significant options are:
   creation uses those names rather than `main`.
 - `-fvk-use-c-layout` makes the shader representation agree with the C++ POD
   representation described below.
-- `-capability spvDescriptorHeapEXT` enables native
+- `-capability spvDescriptorHeapEXT` enables the cube's native
   `SPV_EXT_descriptor_heap` lowering. In Slang's capability definitions this
   also brings in `SPV_KHR_untyped_pointers`.
-- `-DCLEAN_GFX_NATIVE_DESCRIPTOR_HEAP=1` selects direct heap syntax in the
-  example source.
+- `-DCLEAN_GFX_NATIVE_DESCRIPTOR_HEAP=1` selects direct heap syntax in the cube
+  source.
 
 The current resource heap contains only image descriptors and uses
 `VkPhysicalDeviceDescriptorHeapPropertiesEXT::imageDescriptorSize`; samplers
@@ -87,12 +109,11 @@ Primary references:
 ## Native descriptor-heap syntax
 
 The native branch in
-[`examples/triangle/triangle.slang`](../examples/triangle/triangle.slang) is:
+[`examples/cube/cube.slang`](../examples/cube/cube.slang) is:
 
 ```slang
 Texture2D<float4> texture = ResourceDescriptorHeap[root.texture_index];
 SamplerState sampler = SamplerDescriptorHeap[root.sampler_index];
-RWTexture2D<float4> output = ResourceDescriptorHeap[root.texture_index];
 ```
 
 `Texture::sampled_index()` and `Texture::storage_index()` return resource-heap
@@ -117,7 +138,7 @@ and [the SPIR-V-specific lowering](https://github.com/shader-slang/slang/blob/ma
 The fallback is a **compiler compatibility path**, not a runtime fallback from
 `VK_EXT_descriptor_heap`.
 
-At CMake configure time, the triangle build runs `slangc -h` and searches its
+At CMake configure time, the cube build runs `slangc -h` and searches its
 output for `spvDescriptorHeapEXT`:
 
 1. If present, CMake passes `-capability spvDescriptorHeapEXT` and defines
@@ -130,14 +151,12 @@ The older-compiler branch declares conventional unsized descriptor arrays:
 #if defined(CLEAN_GFX_DESCRIPTOR_MAPPING_FALLBACK)
 [[vk::binding(0, 0)]] Texture2D<float4> mapped_textures[];
 [[vk::binding(1, 0)]] SamplerState mapped_samplers[];
-[[vk::binding(2, 0)]] RWTexture2D<float4> mapped_storage_textures[];
 #endif
 
 // ...
 
 Texture2D<float4> texture = mapped_textures[root.texture_index];
 SamplerState sampler = mapped_samplers[root.sampler_index];
-RWTexture2D<float4> output = mapped_storage_textures[root.texture_index];
 ```
 
 During Vulkan pipeline creation, `clean_gfx` chains
@@ -145,7 +164,9 @@ During Vulkan pipeline creation, `clean_gfx` chains
 standard mapping sends set 0, binding 0 sampled images to the resource heap,
 set 0, binding 1 samplers to the sampler heap, and set 0, binding 2 read/write
 images to the resource heap, with device-reported descriptor sizes as array
-strides. The sample exercises all three mappings. The indices returned by the
+strides. The cube exercises the sampled-image and sampler mappings; the triangle
+exercises none because it is pointer-only. Storage-image mapping remains available
+to applications but is not used by either example. The indices returned by the
 public API therefore have the same meaning in native and mapped shaders.
 
 This still creates a descriptor-heap pipeline with a null pipeline layout and
@@ -156,10 +177,9 @@ lacks the required Vulkan extensions. The runtime enables
 
 Layout detection is independent. If an old compiler does not advertise
 `-fvk-use-c-layout`, CMake uses `-fvk-use-scalar-layout` and prints a warning.
-The triangle's shared structures are explicitly padded so those two layouts
-happen to agree for that sample. Scalar layout is not a general C ABI fallback;
-new shared structures should be built with Slang v2026.14.1 or newer and
-`-fvk-use-c-layout`.
+The cube's current shared PODs have asserted layouts that agree under those two
+modes. Scalar layout is not a general C ABI fallback; new shared structures
+should be built with Slang v2026.14.1 or newer and `-fvk-use-c-layout`.
 
 If `spirv-val` is installed, CMake validates mapped-fallback modules against
 Vulkan 1.4. It currently leaves native modules to a current target SDK and
@@ -201,34 +221,34 @@ one another's push-data state.
 - [Slang push constants](https://github.com/shader-slang/slang/blob/master/docs/user-guide/a2-01-spirv-target-specific.md#push-constants)
 - [`VK_EXT_descriptor_heap` proposal, including push data](https://github.com/KhronosGroup/Vulkan-Docs/blob/main/proposals/VK_EXT_descriptor_heap.adoc)
 
-## Buffer device address pointers
+## GPU pointers backed by buffer device addresses
 
-Shared structures spell a device pointer with `CLEAN_GFX_DEVICE_PTR(T)`:
+Shared structures use an ordinary pointer type for a device pointer:
 
 ```c
 struct RootArguments
 {
-    CLEAN_GFX_DEVICE_PTR(Vertex) vertices;
-    uint32 texture_index;
-    uint32 sampler_index;
-    // ...
+    Vertex* vertices;
 };
 ```
 
-[`include/clean_gfx/shader_types.h`](../include/clean_gfx/shader_types.h)
-expands the macro differently on each side:
+This is the complete triangle root. The cube adds `texture_index`,
+`sampler_index`, and four explicit `float4` transform columns to its own root.
+Both C++ and Slang see a typed `Vertex*`. `gpu_malloc()` returns a trivial
+`GpuAllocation {cpu_ptr, gpu_ptr, size}` aggregate. Mapped upload and readback
+allocations provide both addresses, so CPU initialization and root construction
+use different fields of the same POD:
 
-```c
-// Slang
-#define CLEAN_GFX_DEVICE_PTR(type_) type_*
-
-// C++
-#define CLEAN_GFX_DEVICE_PTR(type_) uint64
+```cpp
+auto vertices = device.gpu_malloc<Vertex>(vertex_count);
+auto* vertices_cpu = static_cast<Vertex*>(vertices.cpu_ptr);
+auto* vertices_gpu = static_cast<Vertex*>(vertices.gpu_ptr);
+RootArguments root{.vertices = vertices_gpu /* ... */};
 ```
 
-Thus Slang sees a typed `Vertex*`, while C++ stores the opaque 64-bit value
-returned by `Buffer::address()`. It deliberately never exposes that value as a
-dereferenceable host pointer. The shader can use normal typed access:
+The CPU pointer names the persistently mapped bytes and can be written directly.
+The GPU pointer is only a carrier for GPU virtual-address bits on the CPU and
+must not be dereferenced there. The shader can use normal typed access:
 
 ```slang
 Vertex vertex = root.vertices[vertex_id];
@@ -240,16 +260,38 @@ the `PhysicalStorageBufferAddresses` capability, and the
 is `Ptr<T, Access.Read, AddressSpace.Device>`, but the native `T*` spelling keeps
 the shared header simple.
 
-The Vulkan runtime enables `bufferDeviceAddress`, creates buffers with
-`VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT`, allocates their memory for device
-addresses, and obtains each address with `vkGetBufferDeviceAddress`.
+`gpu_malloc()` with `MemoryType::gpu` still returns the same POD, but `cpu_ptr`
+is null because the allocation is not host-visible; `gpu_ptr` and `size` remain
+valid. `gpu_free()` takes the complete, unchanged `GpuAllocation` returned by
+`gpu_malloc()`, not one of its pointers or a manually constructed range.
+
+If the GPU heap cannot satisfy an allocation, `gpu_malloc()` returns
+`GpuAllocation {nullptr, nullptr, 0}`. A successful `MemoryType::gpu` allocation
+also has a null `cpu_ptr`, so `gpu_ptr` is the validity field. The examples keep
+their paths direct and deliberately do not test their small allocations for failure.
+
+Address-based command APIs use a second trivial aggregate,
+`GpuRange {gpu_ptr, size}`. Construct it from the allocation's GPU fields for a
+whole allocation, or supply an interior GPU pointer and the exact byte count for
+that subrange. The backend asserts that the complete range belongs to a live
+allocation before recording the Vulkan command.
+
+Internally the Vulkan runtime enables `bufferDeviceAddress`, backs allocations
+with 256 MiB heap pages, and gives each page one fully bound universal buffer
+created with `VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT`. It obtains the page's
+base address with `vkGetBufferDeviceAddress` and suballocates it with the pinned
+[OffsetAllocator](https://github.com/sebbbi/OffsetAllocator) revision. Additional
+pages are created on exhaustion. No Vulkan buffer handle or owning allocation
+class is visible to the application; `GpuAllocation` and `GpuRange` are only POD
+address/size carriers.
 
 Important pointer limitations are:
 
 - a BDA pointer has no bound, so robust buffer access cannot make an out-of-range
   dereference safe;
-- the application must keep the allocation alive and satisfy the pointee's
-  alignment;
+- the CPU representation carries a GPU address and cannot be dereferenced by host code;
+- the application must keep allocations referenced through opaque root bytes
+  alive through submission and satisfy the pointee's alignment;
 - opaque resources such as textures and samplers cannot be pointees—use heap
   indices for them;
 - Slang's Vulkan pointer support is intentionally smaller than C++ pointer
@@ -268,9 +310,10 @@ Important pointer limitations are:
 ## Shared C/C++ POD layout
 
 Shader and CPU code both include the same application structure header, as the
-triangle does with
-[`examples/triangle/triangle_shared.h`](../examples/triangle/triangle_shared.h).
-That header first includes `<clean_gfx/shader_types.h>`.
+triangle and cube do with
+[`examples/triangle/triangle_shared.h`](../examples/triangle/triangle_shared.h)
+and [`examples/cube/cube_shared.h`](../examples/cube/cube_shared.h). Each header
+first includes `<clean_gfx/shader_types.h>`.
 
 Slang predefines `__SLANG__`. `shader_types.h` also accepts
 `CLEAN_GFX_SHADER` for custom preprocessing pipelines. On the shader branch it
@@ -294,9 +337,11 @@ rules for every shared structure:
 - add C++ `sizeof`, `alignof`, and `offsetof` assertions for application
   structures, following `triangle_shared.h`;
 - make padding explicit when the ABI is externally visible;
-- avoid matrices in shared roots unless row/column-major order and the CPU
-  representation are fixed explicitly; and
-- keep C++ native pointers, references, containers, constructors, and virtual
+- avoid native matrix types in shared roots unless row/column-major order and the
+  CPU representation are fixed explicitly; the cube uses four `float4` columns;
+  and
+- reserve ordinary pointer fields for GPU addresses, assert their 64-bit ABI,
+  and keep host pointers, references, containers, constructors, and virtual
   members out of shared structures.
 
 Primary references:
@@ -314,8 +359,8 @@ Slang's true 16-bit scalar and vector names include `float16_t`, `float16_t2`,
 ABI preserves all binary16 bit patterns but does not perform host-side numeric
 conversion.
 
-The triangle puts `float16_t2` values directly in its root and converts them to
-`float2` in the shader. `clean_gfx` currently requires and enables:
+Neither current example places a 16-bit value in its root or vertex data.
+`clean_gfx` nevertheless currently requires and enables:
 
 - `storagePushConstant16` for inline 16-bit root members;
 - `shaderFloat16` for FP16 operations and conversions;
@@ -344,8 +389,8 @@ members in root or BDA data until those Vulkan requirements are added.
 - Native descriptor-heap compilation requires Slang v2026.14.1+.
 - The mapped shader path supports older Slang, but still requires
   `VK_EXT_descriptor_heap`; it is not a conventional descriptor-set backend.
-- The scalar-layout fallback is verified only for the explicitly padded triangle
-  structures.
+- The scalar-layout fallback is verified only for the cube's current asserted
+  POD structures.
 - Resource-heap indices currently address image-sized slots; mixed descriptor
   types need a deliberate unified-stride or typed-index policy.
 - Resource and sampler heap indices are separate namespaces.

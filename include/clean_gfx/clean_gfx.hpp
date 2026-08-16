@@ -2,30 +2,34 @@
 
 #include <clean_gfx/shader_types.h>
 
+#include <cassert>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
+#include <limits>
 #include <memory>
 #include <span>
-#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <type_traits>
 
-namespace clean_gfx
+namespace gfx
 {
 
 namespace detail
 {
 struct DeviceState;
-struct BufferAllocation;
 }
 
-using DeviceAddress = std::uint64_t;
-
-class Error final : public std::runtime_error
+enum class Error : std::uint8_t
 {
-public:
-    using std::runtime_error::runtime_error;
+    none,
+    unsupported,
+    out_of_device_memory,
+    out_of_descriptors,
+    invalid_shader,
+    device_lost,
+    driver_error,
 };
 
 enum class MemoryType : std::uint8_t
@@ -35,10 +39,25 @@ enum class MemoryType : std::uint8_t
     readback,
 };
 
+struct GpuRange
+{
+    void* gpu_ptr;
+    std::uint64_t size;
+};
+
+struct GpuAllocation
+{
+    void* cpu_ptr;
+    void* gpu_ptr;
+    std::uint64_t size;
+};
+
 enum class Format : std::uint8_t
 {
     rgba8_unorm,
+    rgba8_srgb,
     bgra8_unorm,
+    bgra8_srgb,
     rgba16_float,
     rgba32_float,
     d32_float,
@@ -100,18 +119,6 @@ enum class IndexType : std::uint8_t
     uint32,
 };
 
-enum class ImageState : std::uint8_t
-{
-    undefined,
-    transfer_source,
-    transfer_destination,
-    shader_read,
-    storage,
-    color_attachment,
-    depth_attachment,
-    present,
-};
-
 enum class Stage : std::uint64_t
 {
     none = 0,
@@ -159,7 +166,7 @@ constexpr Access operator|(Access lhs, Access rhs) noexcept
 
 struct DeviceDesc
 {
-    std::string application_name = "clean_gfx application";
+    const char* application_name = "clean_gfx application";
     std::uint32_t texture_capacity = 4096;
     std::uint32_t sampler_capacity = 256;
     bool enable_validation = true;
@@ -174,37 +181,6 @@ struct DeviceCaps
     std::uint64_t sampler_descriptor_size = 0;
     std::uint32_t first_texture_index = 0;
     std::uint32_t first_sampler_index = 0;
-};
-
-struct BufferDesc
-{
-    std::uint64_t size = 0;
-    MemoryType memory = MemoryType::upload;
-    std::string_view name;
-};
-
-class BufferSlice
-{
-public:
-    BufferSlice() noexcept = default;
-
-    [[nodiscard]] BufferSlice subspan(std::uint64_t offset,
-                                      std::uint64_t byte_count) const;
-
-    [[nodiscard]] DeviceAddress address() const noexcept { return address_; }
-    [[nodiscard]] std::uint64_t size() const noexcept { return size_; }
-    explicit operator bool() const noexcept { return allocation_ != nullptr; }
-
-private:
-    DeviceAddress address_ = 0;
-    std::uint64_t size_ = 0;
-    std::shared_ptr<detail::BufferAllocation> allocation_;
-
-    BufferSlice(DeviceAddress address,
-                std::uint64_t size,
-                std::shared_ptr<detail::BufferAllocation> allocation) noexcept;
-    friend class Buffer;
-    friend class CommandList;
 };
 
 struct TextureDesc
@@ -249,46 +225,18 @@ struct ComputePipelineDesc
 class Device;
 class CommandList;
 
-class Buffer
-{
-public:
-    Buffer() noexcept;
-    ~Buffer();
-    Buffer(Buffer&&) noexcept;
-    Buffer& operator=(Buffer&&) noexcept;
-    Buffer(const Buffer&) = delete;
-    Buffer& operator=(const Buffer&) = delete;
-
-    [[nodiscard]] DeviceAddress address() const noexcept;
-    [[nodiscard]] std::uint64_t size() const noexcept;
-    [[nodiscard]] void* mapped_data() noexcept;
-    [[nodiscard]] const void* mapped_data() const noexcept;
-    [[nodiscard]] BufferSlice slice(std::uint64_t offset = 0,
-                                    std::uint64_t byte_count = 0) const;
-
-    void flush(std::uint64_t offset = 0, std::uint64_t byte_count = 0) const;
-    void invalidate(std::uint64_t offset = 0, std::uint64_t byte_count = 0) const;
-    explicit operator bool() const noexcept;
-
-private:
-    struct Impl;
-    std::unique_ptr<Impl> impl_;
-    explicit Buffer(std::unique_ptr<Impl> impl) noexcept;
-    friend class Device;
-};
-
 class Texture
 {
 public:
     Texture() noexcept;
-    ~Texture();
+    ~Texture() noexcept;
     Texture(Texture&&) noexcept;
     Texture& operator=(Texture&&) noexcept;
     Texture(const Texture&) = delete;
     Texture& operator=(const Texture&) = delete;
 
-    [[nodiscard]] std::uint32_t sampled_index() const;
-    [[nodiscard]] std::uint32_t storage_index() const;
+    [[nodiscard]] std::uint32_t sampled_index() const noexcept;
+    [[nodiscard]] std::uint32_t storage_index() const noexcept;
     [[nodiscard]] std::uint32_t width() const noexcept;
     [[nodiscard]] std::uint32_t height() const noexcept;
     explicit operator bool() const noexcept;
@@ -305,13 +253,13 @@ class Sampler
 {
 public:
     Sampler() noexcept;
-    ~Sampler();
+    ~Sampler() noexcept;
     Sampler(Sampler&&) noexcept;
     Sampler& operator=(Sampler&&) noexcept;
     Sampler(const Sampler&) = delete;
     Sampler& operator=(const Sampler&) = delete;
 
-    [[nodiscard]] std::uint32_t index() const;
+    [[nodiscard]] std::uint32_t index() const noexcept;
     explicit operator bool() const noexcept;
 
 private:
@@ -325,7 +273,7 @@ class Pipeline
 {
 public:
     Pipeline() noexcept;
-    ~Pipeline();
+    ~Pipeline() noexcept;
     Pipeline(Pipeline&&) noexcept;
     Pipeline& operator=(Pipeline&&) noexcept;
     Pipeline(const Pipeline&) = delete;
@@ -344,17 +292,17 @@ class CommandList
 {
 public:
     CommandList() noexcept;
-    ~CommandList();
+    ~CommandList() noexcept;
     CommandList(CommandList&&) noexcept;
     CommandList& operator=(CommandList&&) noexcept;
     CommandList(const CommandList&) = delete;
     CommandList& operator=(const CommandList&) = delete;
 
-    void bind_pipeline(const Pipeline& pipeline);
-    void push_data(std::span<const std::byte> bytes, std::uint32_t offset = 0);
+    void bind_pipeline(const Pipeline& pipeline) noexcept;
+    void push_data(std::span<const std::byte> bytes, std::uint32_t offset = 0) noexcept;
 
     template<typename T>
-    void push_root(const T& value)
+    void push_root(const T& value) noexcept
     {
         static_assert(std::is_standard_layout_v<T> && std::is_trivially_copyable_v<T>,
                       "root data must be a standard-layout, trivially copyable POD");
@@ -367,50 +315,51 @@ public:
                          float4 clear_color = {0.0f, 0.0f, 0.0f, 1.0f},
                          bool clear = true,
                          Texture* depth = nullptr,
-                         float clear_depth = 1.0f);
-    void end_rendering();
+                         float clear_depth = 1.0f) noexcept;
+    void end_rendering() noexcept;
 
     void draw(std::uint32_t vertex_count,
               std::uint32_t instance_count = 1,
               std::uint32_t first_vertex = 0,
-              std::uint32_t first_instance = 0);
-    void draw_indexed(BufferSlice indices,
+              std::uint32_t first_instance = 0) noexcept;
+    void draw_indexed(GpuRange indices,
                       IndexType type,
                       std::uint32_t index_count,
                       std::uint32_t instance_count = 1,
                       std::uint32_t first_index = 0,
                       std::int32_t vertex_offset = 0,
-                      std::uint32_t first_instance = 0);
-    void draw_indirect(BufferSlice arguments,
+                      std::uint32_t first_instance = 0) noexcept;
+    void draw_indirect(GpuRange arguments,
                        std::uint32_t draw_count = 1,
-                       std::uint32_t stride = 0);
-    void draw_indexed_indirect(BufferSlice indices,
+                       std::uint32_t stride = 0) noexcept;
+    void draw_indexed_indirect(GpuRange indices,
                                IndexType type,
-                               BufferSlice arguments,
+                               GpuRange arguments,
                                std::uint32_t draw_count = 1,
-                               std::uint32_t stride = 0);
-    void dispatch(std::uint32_t x, std::uint32_t y = 1, std::uint32_t z = 1);
-    void dispatch_indirect(BufferSlice arguments);
+                               std::uint32_t stride = 0) noexcept;
+    void dispatch(std::uint32_t x, std::uint32_t y = 1,
+                  std::uint32_t z = 1) noexcept;
+    void dispatch_indirect(GpuRange arguments) noexcept;
 
-    void copy_buffer(BufferSlice source, BufferSlice destination,
-                     std::uint64_t byte_count = 0);
-    void copy_buffer_to_texture(BufferSlice source, Texture& destination);
-    void copy_texture_to_buffer(Texture& source, BufferSlice destination);
+    void copy_memory(GpuRange source, GpuRange destination) noexcept;
+    void copy_memory_to_texture(GpuRange source, Texture& destination) noexcept;
+    void copy_texture_to_memory(Texture& source, GpuRange destination) noexcept;
 
-    void transition(Texture& texture, ImageState before, ImageState after);
     void barrier(Stage before, Access before_access,
-                 Stage after, Access after_access);
-    void finish();
+                 Stage after, Access after_access) noexcept;
+    [[nodiscard]] Error finish() noexcept;
     explicit operator bool() const noexcept;
 
 private:
+    struct AddressRange;
     struct Impl;
     std::unique_ptr<Impl> impl_;
     explicit CommandList(std::unique_ptr<Impl> impl) noexcept;
-    void validate_and_retain(const BufferSlice& slice);
-    void retain(Texture& texture);
-    void require_graphics_pipeline() const;
-    void require_compute_pipeline() const;
+    [[nodiscard]] AddressRange validate_and_retain(
+        GpuRange range) noexcept;
+    void retain(Texture& texture) noexcept;
+    [[nodiscard]] bool require_graphics_pipeline() const noexcept;
+    [[nodiscard]] bool require_compute_pipeline() const noexcept;
     friend class Device;
 };
 
@@ -418,25 +367,50 @@ class Device
 {
 public:
     Device() noexcept;
-    ~Device();
+    ~Device() noexcept;
     Device(Device&&) noexcept;
     Device& operator=(Device&&) noexcept;
     Device(const Device&) = delete;
     Device& operator=(const Device&) = delete;
 
-    [[nodiscard]] static Device create(const DeviceDesc& desc = {});
-    [[nodiscard]] const DeviceCaps& caps() const;
+    [[nodiscard]] static Error create(Device& output,
+                                      const DeviceDesc& desc = {}) noexcept;
+    [[nodiscard]] const DeviceCaps& caps() const noexcept;
 
-    [[nodiscard]] Buffer create_buffer(const BufferDesc& desc) const;
-    [[nodiscard]] Texture create_texture(const TextureDesc& desc) const;
-    [[nodiscard]] Sampler create_sampler(const SamplerDesc& desc = {}) const;
-    [[nodiscard]] Pipeline create_graphics_pipeline(
-        const GraphicsPipelineDesc& desc) const;
-    [[nodiscard]] Pipeline create_compute_pipeline(
-        const ComputePipelineDesc& desc) const;
-    [[nodiscard]] CommandList begin_commands() const;
-    void submit_and_wait(CommandList&& commands) const;
-    void wait_idle() const;
+    [[nodiscard]] GpuAllocation gpu_malloc(
+        std::uint64_t byte_count,
+        MemoryType memory = MemoryType::upload,
+        std::uint64_t alignment = 16) const noexcept;
+
+    template<typename T>
+    [[nodiscard]] GpuAllocation gpu_malloc(
+        std::size_t count = 1,
+        MemoryType memory = MemoryType::upload) const noexcept
+    {
+        static_assert(std::is_object_v<T>, "gpu_malloc<T> requires an object type");
+        if (count > std::numeric_limits<std::uint64_t>::max() / sizeof(T))
+        {
+            assert(false && "gpu_malloc size overflow");
+            std::abort();
+        }
+        constexpr std::uint64_t alignment = alignof(T) > 16 ? alignof(T) : 16;
+        return gpu_malloc(
+            static_cast<std::uint64_t>(count) * sizeof(T), memory, alignment);
+    }
+
+    void gpu_free(GpuAllocation allocation) const noexcept;
+
+    [[nodiscard]] Error create_texture(Texture& output,
+                                       const TextureDesc& desc) const noexcept;
+    [[nodiscard]] Error create_sampler(Sampler& output,
+                                       const SamplerDesc& desc = {}) const noexcept;
+    [[nodiscard]] Error create_graphics_pipeline(
+        Pipeline& output, const GraphicsPipelineDesc& desc) const noexcept;
+    [[nodiscard]] Error create_compute_pipeline(
+        Pipeline& output, const ComputePipelineDesc& desc) const noexcept;
+    [[nodiscard]] Error begin_commands(CommandList& output) const noexcept;
+    [[nodiscard]] Error submit_and_wait(CommandList&& commands) const noexcept;
+    [[nodiscard]] Error wait_idle() const noexcept;
     explicit operator bool() const noexcept;
 
 private:
@@ -444,4 +418,4 @@ private:
     explicit Device(std::shared_ptr<detail::DeviceState> impl) noexcept;
 };
 
-} // namespace clean_gfx
+} // namespace gfx

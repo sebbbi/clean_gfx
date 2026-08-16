@@ -17,11 +17,6 @@ typedef int32_t int32;
 typedef uint64_t uint64;
 typedef int64_t int64;
 
-// A shared struct uses this spelling for a device pointer. Slang sees a
-// typed PhysicalStorageBuffer pointer; C++ stores the same bits as an opaque
-// address and therefore cannot accidentally dereference GPU virtual memory.
-#define CLEAN_GFX_DEVICE_PTR(type_) type_*
-
 #else
 
 #include <bit>
@@ -38,8 +33,6 @@ using uint32 = std::uint32_t;
 using int32 = std::int32_t;
 using uint64 = std::uint64_t;
 using int64 = std::int64_t;
-
-#define CLEAN_GFX_DEVICE_PTR(type_) uint64
 
 // CPU-side binary16 values are deliberately opaque storage. Conversion to or
 // from float is kept out of the shared ABI layer so every bit pattern,
@@ -190,6 +183,8 @@ static_assert(sizeof(uint32) == 4 && alignof(uint32) == 4);
 static_assert(sizeof(int32) == 4 && alignof(int32) == 4);
 static_assert(sizeof(uint64) == 8 && alignof(uint64) == 8);
 static_assert(sizeof(int64) == 8 && alignof(int64) == 8);
+static_assert(sizeof(void*) == sizeof(uint64) && alignof(void*) == alignof(uint64),
+              "shared GPU pointers require a 64-bit pointer ABI");
 
 #define CLEAN_GFX_ASSERT_SHARED_TYPE(type_, scalar_, component_count_)                        \
     static_assert(std::is_standard_layout_v<type_>);                                          \

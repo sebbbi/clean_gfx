@@ -1,8 +1,10 @@
 add_executable(clean_gfx_shader_types_test shader_types_test.cpp)
+clean_gfx_disable_exceptions(clean_gfx_shader_types_test)
 target_link_libraries(clean_gfx_shader_types_test PRIVATE clean_gfx::clean_gfx)
 add_test(NAME clean_gfx.shader_types COMMAND clean_gfx_shader_types_test)
 
 add_executable(clean_gfx_api_test api_test.cpp)
+clean_gfx_disable_exceptions(clean_gfx_api_test)
 target_link_libraries(clean_gfx_api_test PRIVATE clean_gfx::clean_gfx)
 add_test(NAME clean_gfx.api COMMAND clean_gfx_api_test)
 
