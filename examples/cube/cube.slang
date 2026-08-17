@@ -17,12 +17,17 @@ struct VertexOutput
 VertexOutput vertexMain(uint vertex_id : SV_VertexID)
 {
     CubeVertex vertex = root.vertices[vertex_id];
-    float4 transformed = mul(root.mvp, vertex.position);
+    float3 transformed = mul(root.transform, vertex.position);
+    float4 clip_position = float4(
+        transformed.xy,
+        root.depth_transform.x * transformed.z +
+            root.depth_transform.y * vertex.position.w,
+        transformed.z);
 
     VertexOutput output;
-    output.position = transformed;
+    output.position = clip_position;
     output.uv = vertex.uv;
-    output.fragment_position = transformed.xyz;
+    output.fragment_position = clip_position.xyz;
     return output;
 }
 

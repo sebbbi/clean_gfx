@@ -11,6 +11,10 @@
 There are no application-visible descriptor sets, descriptor pools, or pipeline
 layouts in the shader compilation path described below.
 
+The host side uses free functions in namespace `gfx` over opaque `Device*`, `Texture*`,
+`Pipeline*`, and `CommandList*` handles. Textures, pipelines, and devices are destroyed explicitly;
+submitting a command list consumes its handle. These are raw handles rather than RAII wrappers.
+
 ## Supported Slang version
 
 **Slang v2026.14.1 or newer is required.** The cube uses native descriptor-heap
@@ -84,8 +88,7 @@ The significant options are:
   creation uses those names rather than `main`.
 - `-fvk-use-c-layout` makes the shader representation agree with the C++ POD
   representation described below.
-- `-matrix-layout-row-major` selects the matrix ABI used by the C++ matrix PODs
-  in the cube and other matrix-using shaders.
+- `-matrix-layout-row-major` selects the matrix ABI used by the C++ `float3x4` POD.
 - `-capability spvDescriptorHeapEXT` enables the cube's native
   `SPV_EXT_descriptor_heap` lowering. In Slang's capability definitions this
   also brings in `SPV_KHR_untyped_pointers`.
@@ -138,33 +141,34 @@ runtime sampler index is needed in the root.
 
 ## Application-owned descriptor heaps
 
-Descriptor heaps have explicit allocation calls because Vulkan gives descriptor-capable buffers
+Descriptor heaps have explicit free-function allocation calls because Vulkan gives descriptor-capable buffers
 heap-specific size, alignment, and reserved-range rules:
 
 ```cpp
-auto resource_heap = device.gpu_malloc_resource_heap(
-    device.caps().image_descriptor_size);
-auto sampler_heap = device.gpu_malloc_sampler_heap(
-    device.caps().sampler_descriptor_size *
+const gfx::DeviceCaps caps = gfx::get_device_caps(device);
+gfx::GpuAllocation<std::byte> resource_heap = gfx::gpu_malloc_resource_heap(
+    device, caps.image_descriptor_size);
+gfx::GpuAllocation<std::byte> sampler_heap = gfx::gpu_malloc_sampler_heap(
+    device, caps.sampler_descriptor_size *
         static_cast<std::uint32_t>(CubeSampler::count));
 ```
 
-Both allocations return directly usable coherent `cpu_ptr` and `gpu_ptr` values. Their reported
+Both allocations return directly usable coherent `cpu` and `gpu` values. Their reported
 `size` is exactly the requested user byte count. Vulkan requires an implementation-reserved region;
 clean_gfx appends it as a hidden suffix outside the returned range, so user descriptor slot zero is
-exactly the returned pointer. Slot `i` begins at `cpu_ptr + i * descriptor_size`.
+exactly the returned pointer. Slot `i` begins at `cpu + i * descriptor_size`.
 Each heap allocation owns one exact-sized descriptor-capable `VkBuffer` and one dedicated coherent
 mapped device-memory allocation. Its private size includes alignment padding and the hidden suffix;
 descriptor heaps are not suballocated from the ordinary 256 MiB buffer pages.
 
-`Device::write_texture_descriptor()` writes a sampled or storage descriptor to a caller-selected
+`write_texture_descriptor()` writes a sampled or storage descriptor to a caller-selected
 CPU address. `TextureViewDesc::mip_count == 0` selects every mip from `base_mip` onward.
-`Device::write_sampler_descriptor()` writes a sampler descriptor without creating a public sampler
+`write_sampler_descriptor()` writes a sampler descriptor without creating a public sampler
 object. A command list that executes a shader using either heap binds the user ranges explicitly:
 
 ```cpp
-commands.set_resource_heap({resource_heap.gpu_ptr, resource_heap.size});
-commands.set_sampler_heap({sampler_heap.gpu_ptr, sampler_heap.size});
+gfx::set_resource_heap(commands, gfx::gpu_range(resource_heap));
+gfx::set_sampler_heap(commands, gfx::gpu_range(sampler_heap));
 ```
 
 Heaps are command state, not device-global retained objects. The backend neither owns descriptor
@@ -191,23 +195,23 @@ shader declares no root block; this records the Vulkan draw or dispatch without 
 `vkCmdPushDataEXT`:
 
 ```cpp
-commands.draw(nullptr, 3);
+gfx::draw(commands, nullptr, 3);
 ```
 
 Otherwise, the root is an ordinary CPU POD and the typed overload infers its complete size:
 
 ```cpp
 RootArguments root{};
-root.vertices = static_cast<Vertex*>(vertices.gpu_ptr);
+root.vertices = vertices.gpu;
 
-commands.draw(&root, vertex_count);
-// commands.dispatch(&root, x, y, z);
+gfx::draw(commands, &root, vertex_count);
+// gfx::dispatch(commands, &root, x, y, z);
 ```
 
-The typed methods infer `sizeof(RootArguments)` from the pointed-to type
+The typed free functions infer `sizeof(RootArguments)` from the pointed-to type
 and record `vkCmdPushDataEXT` immediately before the corresponding Vulkan draw or dispatch command.
 Vulkan copies those CPU bytes while recording, so the root may be stack-local and may be changed or
-destroyed as soon as the method returns. The root size must not exceed
+destroyed as soon as the recording call returns. The root size must not exceed
 `DeviceCaps::max_push_data_size`. There is no separate public push-data command and no partial-update
 API.
 
@@ -236,20 +240,21 @@ struct CubeRootArguments
     CubeVertex* vertices;
     uint32 texture_index;
     uint32 padding;
-    float4x4 mvp;
+    float3x4 transform;
+    float2 depth_transform;
 };
 ```
 
 The triangle is rootless. The cube's sampler selection is the shared compile-time `CubeSampler`
-enum rather than another root value. Both C++ and Slang see a typed `CubeVertex*`. `gpu_malloc()` returns a trivial
-`GpuAllocation {cpu_ptr, gpu_ptr, size}` aggregate. The default `MemoryType::default_` and readback
+enum rather than another root value. Both C++ and Slang see a typed `CubeVertex*`. `gpu_malloc<T>()` returns a trivial
+`GpuAllocation<T> {cpu, gpu, size}` aggregate. The default `MemoryType::default_` and readback
 allocations provide both addresses from coherent mapped device-local memory. The allocation holds the vertices; the root itself remains an
 ordinary CPU value:
 
 ```cpp
-auto vertices = device.gpu_malloc<CubeVertex>(vertex_count);
-CubeRootArguments root{.vertices = static_cast<CubeVertex*>(vertices.gpu_ptr)};
-commands.draw(&root, vertex_count);
+gfx::GpuAllocation<CubeVertex> vertices = gfx::gpu_malloc<CubeVertex>(device, vertex_count);
+CubeRootArguments root{.vertices = vertices.gpu};
+gfx::draw(commands, &root, vertex_count);
 ```
 
 The CPU pointer names the persistently mapped bytes and can be written directly.
@@ -266,19 +271,19 @@ the `PhysicalStorageBufferAddresses` capability, and the
 is `Ptr<T, Access.Read, AddressSpace.Device>`, but the native `T*` spelling keeps
 the shared header simple.
 
-`gpu_malloc()` with `MemoryType::gpu_only` still returns the same POD, but `cpu_ptr`
-is null because the allocation is not host-visible; `gpu_ptr` and `size` remain
+`gpu_malloc()` with `MemoryType::gpu_only` still returns the same POD, but `cpu`
+is null because the allocation is not host-visible; `gpu` and `size` remain
 valid. `gpu_free()` takes the complete, unchanged `GpuAllocation` returned by
 `gpu_malloc()`, not one of its pointers or a manually constructed range.
 
 If GPU memory cannot satisfy an allocation, `gpu_malloc()` and the two descriptor-heap allocation
 functions return `GpuAllocation {nullptr, nullptr, 0}`. A successful `MemoryType::gpu_only` allocation
-also has a null `cpu_ptr`, so `gpu_ptr` is the validity field. The examples keep
+also has a null `cpu`, so `gpu` is the validity field. The examples keep
 their paths direct and deliberately do not test their small allocations for failure.
 
 Address-based command APIs use a second trivial aggregate,
-`GpuRange {gpu_ptr, size}`. Construct it from the allocation's GPU fields for a
-whole allocation, or supply an interior GPU pointer and the exact byte count for
+`GpuRange {gpu, size}`. Call `gpu_range(allocation)` for a whole allocation, or supply an interior
+GPU pointer and the exact byte count for
 that subrange. The backend passes this address/size pair directly to the Vulkan
 device-address command. Command recording performs no allocation lookup and does not retain the
 allocation; validity, bounds, and lifetime are the application's responsibility.
@@ -325,18 +330,16 @@ does with [`examples/cube/cube_shared.h`](../examples/cube/cube_shared.h). It fi
 
 Slang predefines `__SLANG__`, which `shader_types.h` uses to select its shader branch. That branch
 uses Slang's native `float2`, `float3`, `float4`, `int2`, `uint4`, `float16_t2`, `int16_t3`,
-`uint16_t4`, matrix types, and similar types. On the C++ branch it declares scalar-member POD types
-with the same names and verifies their size, alignment, member offsets, triviality, IEEE-754 float
-representation, and little-endian host byte order.
+`uint16_t4`, `float3x4`, and similar types. On the C++ branch it declares matching scalar-member
+POD types.
 
 `-fvk-use-c-layout` is required because it applies C/C++ layout rules to values
 accessed through `ConstantBuffer`, `ParameterBlock`, `StructuredBuffer`,
 `ByteAddressBuffer`, and general pointers. Every shader sharing C++ POD structures is compiled
 with this option. Structures containing matrices also require
-`-matrix-layout-row-major`. The provided
-`float2x2`, `float3x3`, `float4x4`, and `float3x4` C++ POD names match Slang's
-built-ins and store compact rows. Slang names matrix dimensions as rows by columns,
-so `float3x4` contains three `float4` rows. Shared structures do not
+`-matrix-layout-row-major`. The provided `float3x4` C++ POD matches Slang's built-in and stores
+compact rows. Slang names matrix dimensions as rows by columns, so `float3x4` contains three
+`float4` rows. Shared structures do not
 support an alternate layout mode.
 
 The runtime requires and enables Vulkan `scalarBlockLayout`. Keep shared structures simple:
@@ -344,8 +347,8 @@ The runtime requires and enables Vulkan `scalarBlockLayout`. Keep shared structu
 - use the scalar-member types supplied by `shader_types.h`, not host SIMD types
   with platform-specific alignment;
 - make padding explicit when the ABI is externally visible;
-- use the supplied matrix PODs with the row-major compiler option; the
-  cube uses `float4x4` and `mul(matrix, vector)`; and
+- use the supplied `float3x4` with the row-major compiler option; the cube packs clip-space X, Y,
+  and W into its three rows and reconstructs depth from W; and
 - reserve ordinary pointer fields for GPU addresses, and keep host pointers,
   references, containers, constructors, and virtual
   members out of shared structures.

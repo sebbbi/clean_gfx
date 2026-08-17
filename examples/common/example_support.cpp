@@ -21,7 +21,6 @@ const char* gfx_error_name(gfx::Error error) noexcept
     case gfx::Error::none: return "none";
     case gfx::Error::unsupported: return "unsupported";
     case gfx::Error::out_of_device_memory: return "out of device memory";
-    case gfx::Error::invalid_shader: return "invalid shader";
     case gfx::Error::device_lost: return "device lost";
     case gfx::Error::driver_error: return "driver error";
     }
@@ -29,41 +28,31 @@ const char* gfx_error_name(gfx::Error error) noexcept
     return "unknown error";
 }
 
-bool gfx_succeeded(gfx::Error error,
-                   const char* application,
-                   const char* operation) noexcept
-{
-    if (error == gfx::Error::none)
-        return true;
-    std::cerr << application << ": " << operation << ": " << gfx_error_name(error) << '\n';
-    return false;
-}
-
-bool read_spirv(const char* application,
-                const char* path,
-                std::vector<std::uint32_t>& words) noexcept
+std::vector<std::uint32_t> read_spirv(const char* application,
+                                      const char* path) noexcept
 {
     std::ifstream file(path, std::ios::binary | std::ios::ate);
     if (!file)
     {
         std::cerr << application << ": could not open shader: " << path << '\n';
-        return false;
+        return {};
     }
-    const auto end = file.tellg();
+    const std::streampos end = file.tellg();
     if (end <= 0 || static_cast<std::uint64_t>(end) % sizeof(std::uint32_t) != 0)
     {
         std::cerr << application << ": invalid SPIR-V file: " << path << '\n';
-        return false;
+        return {};
     }
-    words.resize(static_cast<std::size_t>(end) / sizeof(std::uint32_t));
+    std::vector<std::uint32_t> words(
+        static_cast<std::size_t>(end) / sizeof(std::uint32_t));
     file.seekg(0);
     file.read(reinterpret_cast<char*>(words.data()), end);
     if (!file)
     {
         std::cerr << application << ": could not read shader: " << path << '\n';
-        return false;
+        return {};
     }
-    return true;
+    return words;
 }
 
 bool write_bgra8_ppm(const char* application,
@@ -82,7 +71,7 @@ bool write_bgra8_ppm(const char* application,
     file << "P6\n" << width << ' ' << height << "\n255\n";
     for (std::uint64_t i = 0; i < static_cast<std::uint64_t>(width) * height; ++i)
     {
-        const auto* pixel = bgra + i * 4;
+        const std::byte* pixel = bgra + i * 4;
         const char rgb[3]{
             static_cast<char>(pixel[2]),
             static_cast<char>(pixel[1]),
@@ -112,15 +101,6 @@ LRESULT CALLBACK example_window_proc(HWND hwnd,
                                      WPARAM wparam,
                                      LPARAM lparam) noexcept
 {
-    auto* window = reinterpret_cast<ExampleWindow*>(
-        GetWindowLongPtrA(hwnd, GWLP_USERDATA));
-    if (message == WM_NCCREATE)
-    {
-        const auto* create = reinterpret_cast<const CREATESTRUCTA*>(lparam);
-        window = static_cast<ExampleWindow*>(create->lpCreateParams);
-        SetWindowLongPtrA(hwnd, GWLP_USERDATA,
-                          reinterpret_cast<LONG_PTR>(window));
-    }
     switch (message)
     {
     case WM_ERASEBKGND:
@@ -136,11 +116,6 @@ LRESULT CALLBACK example_window_proc(HWND hwnd,
         }
         return DefWindowProcA(hwnd, message, wparam, lparam);
     case WM_DESTROY:
-        if (window)
-        {
-            window->handle = nullptr;
-            window->running = false;
-        }
         PostQuitMessage(0);
         return 0;
     default:
@@ -150,12 +125,11 @@ LRESULT CALLBACK example_window_proc(HWND hwnd,
 
 } // namespace
 
-bool open_example_window(ExampleWindow& window,
-                         const char* title,
-                         std::uint32_t width,
-                         std::uint32_t height) noexcept
+ExampleWindow open_example_window(const char* title,
+                                  std::uint32_t width,
+                                  std::uint32_t height) noexcept
 {
-    assert(!window.handle && title && width && height);
+    assert(title && width && height);
     const HINSTANCE instance = GetModuleHandleA(nullptr);
     WNDCLASSEXA window_class{
         .cbSize = sizeof(WNDCLASSEXA),
@@ -166,13 +140,12 @@ bool open_example_window(ExampleWindow& window,
         .lpszClassName = window_class_name,
     };
     if (!RegisterClassExA(&window_class) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS)
-        return false;
+        return {};
 
     RECT rectangle{0, 0, static_cast<LONG>(width), static_cast<LONG>(height)};
     if (!AdjustWindowRectEx(&rectangle, window_style, FALSE, 0))
-        return false;
+        return {};
 
-    window.running = true;
     const HWND hwnd = CreateWindowExA(
         0,
         window_class_name,
@@ -185,16 +158,12 @@ bool open_example_window(ExampleWindow& window,
         nullptr,
         nullptr,
         instance,
-        &window);
+        nullptr);
     if (!hwnd)
-    {
-        window.running = false;
-        return false;
-    }
-    window.handle = hwnd;
+        return {};
     ShowWindow(hwnd, SW_SHOWDEFAULT);
     UpdateWindow(hwnd);
-    return true;
+    return {.handle = hwnd, .running = true};
 }
 
 bool pump_example_window(ExampleWindow& window) noexcept
@@ -203,7 +172,10 @@ bool pump_example_window(ExampleWindow& window) noexcept
     while (PeekMessageA(&message, nullptr, 0, 0, PM_REMOVE))
     {
         if (message.message == WM_QUIT)
+        {
+            window.handle = nullptr;
             window.running = false;
+        }
         TranslateMessage(&message);
         DispatchMessageA(&message);
     }
@@ -258,12 +230,11 @@ void close_example_window(ExampleWindow& window) noexcept
 
 #else
 
-bool open_example_window(ExampleWindow&,
-                         const char*,
-                         std::uint32_t,
-                         std::uint32_t) noexcept
+ExampleWindow open_example_window(const char*,
+                                  std::uint32_t,
+                                  std::uint32_t) noexcept
 {
-    return false;
+    return {};
 }
 
 bool pump_example_window(ExampleWindow&) noexcept

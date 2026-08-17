@@ -3,7 +3,7 @@
 #if defined(__SLANG__)
 
 // Slang already provides float[2-4], int[2-4], uint[2-4], float16_t[2-4],
-// int16_t[2-4], uint16_t[2-4], and native matrix types such as float4x4.
+// int16_t[2-4], uint16_t[2-4], and the native float3x4 matrix type.
 // Redeclaring those types would hide the built-ins and can change shader semantics.
 // Only add the short scalar aliases used by shared clean_gfx structures.
 typedef uint8_t uint8;
@@ -17,11 +17,7 @@ typedef int64_t int64;
 
 #else
 
-#include <bit>
-#include <cstddef>
 #include <cstdint>
-#include <limits>
-#include <type_traits>
 
 using uint8 = std::uint8_t;
 using int8 = std::int8_t;
@@ -61,23 +57,7 @@ struct float4
     float w;
 };
 
-// Slang matrix names use row-count x column-count. Each C++ POD stores one
-// vector per row, matching the row-major shader layout.
-struct float2x2
-{
-    float2 rows[2];
-};
-
-struct float3x3
-{
-    float3 rows[3];
-};
-
-struct float4x4
-{
-    float4 rows[4];
-};
-
+// Slang names matrix dimensions as row-count x column-count.
 struct float3x4
 {
     float4 rows[3];
@@ -187,90 +167,5 @@ struct uint16_t4
     uint16 z;
     uint16 w;
 };
-
-static_assert(std::endian::native == std::endian::little,
-              "Slang shared data requires a little-endian CPU");
-static_assert(sizeof(float) == 4 && alignof(float) == 4);
-static_assert(std::numeric_limits<float>::is_iec559);
-static_assert(std::numeric_limits<float>::digits == 24);
-static_assert(std::numeric_limits<float>::max_exponent == 128);
-
-static_assert(sizeof(uint8) == 1 && alignof(uint8) == 1);
-static_assert(sizeof(int8) == 1 && alignof(int8) == 1);
-static_assert(sizeof(uint16) == 2 && alignof(uint16) == 2);
-static_assert(sizeof(int16) == 2 && alignof(int16) == 2);
-static_assert(sizeof(uint32) == 4 && alignof(uint32) == 4);
-static_assert(sizeof(int32) == 4 && alignof(int32) == 4);
-static_assert(sizeof(uint64) == 8 && alignof(uint64) == 8);
-static_assert(sizeof(int64) == 8 && alignof(int64) == 8);
-static_assert(sizeof(void*) == sizeof(uint64) && alignof(void*) == alignof(uint64),
-              "shared GPU pointers require a 64-bit pointer ABI");
-
-#define CLEAN_GFX_ASSERT_SHARED_TYPE(type_, scalar_, component_count_)                        \
-    static_assert(std::is_standard_layout_v<type_>);                                          \
-    static_assert(std::is_trivial_v<type_>);                                                  \
-    static_assert(std::is_trivially_copyable_v<type_>);                                       \
-    static_assert(std::is_aggregate_v<type_>);                                                \
-    static_assert(sizeof(type_) == sizeof(scalar_) * (component_count_));                     \
-    static_assert(alignof(type_) == alignof(scalar_))
-
-#define CLEAN_GFX_ASSERT_SHARED_VECTOR(type_, scalar_, component_count_)                      \
-    CLEAN_GFX_ASSERT_SHARED_TYPE(type_, scalar_, component_count_);                           \
-    static_assert(std::is_same_v<decltype(type_::x), scalar_>);                               \
-    static_assert(offsetof(type_, x) == 0)
-
-#define CLEAN_GFX_ASSERT_SHARED_VEC2(type_, scalar_)                                          \
-    CLEAN_GFX_ASSERT_SHARED_VECTOR(type_, scalar_, 2);                                        \
-    static_assert(std::is_same_v<decltype(type_::y), scalar_>);                               \
-    static_assert(offsetof(type_, y) == sizeof(scalar_))
-
-#define CLEAN_GFX_ASSERT_SHARED_VEC3(type_, scalar_)                                          \
-    CLEAN_GFX_ASSERT_SHARED_VECTOR(type_, scalar_, 3);                                        \
-    static_assert(std::is_same_v<decltype(type_::y), scalar_>);                               \
-    static_assert(std::is_same_v<decltype(type_::z), scalar_>);                               \
-    static_assert(offsetof(type_, y) == sizeof(scalar_));                                     \
-    static_assert(offsetof(type_, z) == sizeof(scalar_) * 2)
-
-#define CLEAN_GFX_ASSERT_SHARED_VEC4(type_, scalar_)                                          \
-    CLEAN_GFX_ASSERT_SHARED_VECTOR(type_, scalar_, 4);                                        \
-    static_assert(std::is_same_v<decltype(type_::y), scalar_>);                               \
-    static_assert(std::is_same_v<decltype(type_::z), scalar_>);                               \
-    static_assert(std::is_same_v<decltype(type_::w), scalar_>);                               \
-    static_assert(offsetof(type_, y) == sizeof(scalar_));                                     \
-    static_assert(offsetof(type_, z) == sizeof(scalar_) * 2);                                 \
-    static_assert(offsetof(type_, w) == sizeof(scalar_) * 3)
-
-CLEAN_GFX_ASSERT_SHARED_TYPE(float16_t, uint16, 1);
-static_assert(std::is_same_v<decltype(float16_t::bits), uint16>);
-static_assert(offsetof(float16_t, bits) == 0);
-
-CLEAN_GFX_ASSERT_SHARED_VEC2(float2, float);
-CLEAN_GFX_ASSERT_SHARED_VEC3(float3, float);
-CLEAN_GFX_ASSERT_SHARED_VEC4(float4, float);
-CLEAN_GFX_ASSERT_SHARED_TYPE(float2x2, float, 4);
-CLEAN_GFX_ASSERT_SHARED_TYPE(float3x3, float, 9);
-CLEAN_GFX_ASSERT_SHARED_TYPE(float4x4, float, 16);
-CLEAN_GFX_ASSERT_SHARED_TYPE(float3x4, float, 12);
-CLEAN_GFX_ASSERT_SHARED_VEC2(int2, int32);
-CLEAN_GFX_ASSERT_SHARED_VEC3(int3, int32);
-CLEAN_GFX_ASSERT_SHARED_VEC4(int4, int32);
-CLEAN_GFX_ASSERT_SHARED_VEC2(uint2, uint32);
-CLEAN_GFX_ASSERT_SHARED_VEC3(uint3, uint32);
-CLEAN_GFX_ASSERT_SHARED_VEC4(uint4, uint32);
-CLEAN_GFX_ASSERT_SHARED_VEC2(float16_t2, float16_t);
-CLEAN_GFX_ASSERT_SHARED_VEC3(float16_t3, float16_t);
-CLEAN_GFX_ASSERT_SHARED_VEC4(float16_t4, float16_t);
-CLEAN_GFX_ASSERT_SHARED_VEC2(int16_t2, int16);
-CLEAN_GFX_ASSERT_SHARED_VEC3(int16_t3, int16);
-CLEAN_GFX_ASSERT_SHARED_VEC4(int16_t4, int16);
-CLEAN_GFX_ASSERT_SHARED_VEC2(uint16_t2, uint16);
-CLEAN_GFX_ASSERT_SHARED_VEC3(uint16_t3, uint16);
-CLEAN_GFX_ASSERT_SHARED_VEC4(uint16_t4, uint16);
-
-#undef CLEAN_GFX_ASSERT_SHARED_VEC4
-#undef CLEAN_GFX_ASSERT_SHARED_VEC3
-#undef CLEAN_GFX_ASSERT_SHARED_VEC2
-#undef CLEAN_GFX_ASSERT_SHARED_VECTOR
-#undef CLEAN_GFX_ASSERT_SHARED_TYPE
 
 #endif

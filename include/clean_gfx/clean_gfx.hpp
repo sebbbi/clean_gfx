@@ -7,26 +7,23 @@
 #include <cstdint>
 #include <cstdlib>
 #include <limits>
-#include <memory>
 #include <span>
-#include <string>
 #include <string_view>
 #include <type_traits>
 
 namespace gfx
 {
 
-namespace detail
-{
-struct DeviceState;
-}
+struct Device;
+struct Texture;
+struct Pipeline;
+struct CommandList;
 
 enum class Error : std::uint8_t
 {
     none,
     unsupported,
     out_of_device_memory,
-    invalid_shader,
     device_lost,
     driver_error,
 };
@@ -40,14 +37,15 @@ enum class MemoryType : std::uint8_t
 
 struct GpuRange
 {
-    void* gpu_ptr;
+    void* gpu;
     std::uint64_t size;
 };
 
+template<typename T = std::byte>
 struct GpuAllocation
 {
-    void* cpu_ptr;
-    void* gpu_ptr;
+    T* cpu;
+    T* gpu;
     std::uint64_t size;
 };
 
@@ -176,11 +174,17 @@ struct DeviceDesc
 
 struct DeviceCaps
 {
-    std::string device_name;
-    std::uint32_t api_version = 0;
-    std::uint64_t max_push_data_size = 0;
-    std::uint64_t image_descriptor_size = 0;
-    std::uint64_t sampler_descriptor_size = 0;
+    const char* device_name;
+    std::uint32_t api_version;
+    std::uint64_t max_push_data_size;
+    std::uint64_t image_descriptor_size;
+    std::uint64_t sampler_descriptor_size;
+};
+
+struct DeviceInit
+{
+    Device* device;
+    Error error;
 };
 
 struct TextureDesc
@@ -228,319 +232,303 @@ struct ComputePipelineDesc
     std::string_view name;
 };
 
-class Device;
-class CommandList;
+[[nodiscard]] DeviceInit create_device(const DeviceDesc& desc = {}) noexcept;
+void destroy_device(Device* device) noexcept;
+[[nodiscard]] DeviceCaps get_device_caps(const Device* device) noexcept;
 
-class Texture
+[[nodiscard]] GpuAllocation<> gpu_malloc(
+    Device* device,
+    std::uint64_t byte_count,
+    MemoryType memory = MemoryType::default_,
+    std::uint64_t alignment = 16) noexcept;
+
+template<typename T>
+[[nodiscard]] GpuAllocation<T> gpu_malloc(
+    Device* device,
+    std::size_t count = 1,
+    MemoryType memory = MemoryType::default_) noexcept
 {
-public:
-    Texture() noexcept;
-    ~Texture() noexcept;
-    Texture(Texture&&) noexcept;
-    Texture& operator=(Texture&&) noexcept;
-    Texture(const Texture&) = delete;
-    Texture& operator=(const Texture&) = delete;
+    static_assert(std::is_object_v<T>, "gpu_malloc<T> requires an object type");
+    static_assert(!std::is_const_v<T> && !std::is_volatile_v<T>,
+                  "gpu_malloc<T> requires a mutable object type");
+    if (count > std::numeric_limits<std::uint64_t>::max() / sizeof(T))
+    {
+        assert(false && "gpu_malloc size overflow");
+        std::abort();
+    }
+    constexpr std::uint64_t alignment = alignof(T) > 16 ? alignof(T) : 16;
+    const GpuAllocation<> bytes = gpu_malloc(
+        device, static_cast<std::uint64_t>(count) * sizeof(T), memory, alignment);
+    return {
+        .cpu = reinterpret_cast<T*>(bytes.cpu),
+        .gpu = reinterpret_cast<T*>(bytes.gpu),
+        .size = bytes.size,
+    };
+}
 
-    [[nodiscard]] std::uint32_t width() const noexcept;
-    [[nodiscard]] std::uint32_t height() const noexcept;
-    explicit operator bool() const noexcept;
+[[nodiscard]] GpuAllocation<> gpu_malloc_resource_heap(
+    Device* device, std::uint64_t byte_count) noexcept;
+[[nodiscard]] GpuAllocation<> gpu_malloc_sampler_heap(
+    Device* device, std::uint64_t byte_count) noexcept;
+void gpu_free(Device* device, GpuAllocation<> allocation) noexcept;
 
-private:
-    struct Impl;
-    std::unique_ptr<Impl> impl_;
-    explicit Texture(std::unique_ptr<Impl> impl) noexcept;
-    friend class Device;
-    friend class CommandList;
-};
-
-class Pipeline
+template<typename T>
+void gpu_free(Device* device, GpuAllocation<T> allocation) noexcept
 {
-public:
-    Pipeline() noexcept;
-    ~Pipeline() noexcept;
-    Pipeline(Pipeline&&) noexcept;
-    Pipeline& operator=(Pipeline&&) noexcept;
-    Pipeline(const Pipeline&) = delete;
-    Pipeline& operator=(const Pipeline&) = delete;
-    explicit operator bool() const noexcept;
+    gpu_free(device, {
+        .cpu = reinterpret_cast<std::byte*>(allocation.cpu),
+        .gpu = reinterpret_cast<std::byte*>(allocation.gpu),
+        .size = allocation.size,
+    });
+}
 
-private:
-    struct Impl;
-    std::unique_ptr<Impl> impl_;
-    explicit Pipeline(std::unique_ptr<Impl> impl) noexcept;
-    friend class Device;
-    friend class CommandList;
-};
-
-class CommandList
+template<typename T>
+[[nodiscard]] constexpr GpuRange gpu_range(GpuAllocation<T> allocation) noexcept
 {
-public:
-    CommandList() noexcept;
-    ~CommandList() noexcept;
-    CommandList(CommandList&&) noexcept;
-    CommandList& operator=(CommandList&&) noexcept;
-    CommandList(const CommandList&) = delete;
-    CommandList& operator=(const CommandList&) = delete;
+    return {.gpu = static_cast<void*>(allocation.gpu), .size = allocation.size};
+}
 
-    void bind_pipeline(const Pipeline& pipeline) noexcept;
-    void set_resource_heap(GpuRange heap) noexcept;
-    void set_sampler_heap(GpuRange heap) noexcept;
+[[nodiscard]] Texture* create_texture(Device* device,
+                                      const TextureDesc& desc) noexcept;
+void destroy_texture(Texture* texture) noexcept;
+[[nodiscard]] std::uint32_t texture_width(const Texture* texture) noexcept;
+[[nodiscard]] std::uint32_t texture_height(const Texture* texture) noexcept;
+void write_texture_descriptor(Device* device,
+                              void* cpu_destination,
+                              const Texture* texture,
+                              TextureDescriptorType type,
+                              const TextureViewDesc& view = {}) noexcept;
+void write_sampler_descriptor(Device* device,
+                              void* cpu_destination,
+                              const SamplerDesc& desc = {}) noexcept;
 
-    void begin_rendering(Texture& color,
-                         float4 clear_color = {0.0f, 0.0f, 0.0f, 1.0f},
-                         bool clear = true,
-                         Texture* depth = nullptr,
-                         float clear_depth = 1.0f) noexcept;
-    void end_rendering() noexcept;
+[[nodiscard]] Pipeline* create_graphics_pipeline(
+    Device* device, const GraphicsPipelineDesc& desc) noexcept;
+[[nodiscard]] Pipeline* create_compute_pipeline(
+    Device* device, const ComputePipelineDesc& desc) noexcept;
+void destroy_pipeline(Pipeline* pipeline) noexcept;
 
-    template<typename Root>
-    void draw(const Root* root,
-              std::uint32_t vertex_count,
-              std::uint32_t instance_count = 1,
-              std::uint32_t first_vertex = 0,
-              std::uint32_t first_instance = 0) noexcept
-    {
-        draw_impl(root, root ? root_data_size<Root>() : 0, vertex_count, instance_count,
-                  first_vertex, first_instance);
-    }
+[[nodiscard]] CommandList* begin_commands(Device* device) noexcept;
+void destroy_command_list(CommandList* commands) noexcept;
+void submit(Device* device, CommandList* commands) noexcept;
+void submit_and_wait(Device* device, CommandList* commands) noexcept;
+void wait_idle(Device* device) noexcept;
 
-    void draw(std::nullptr_t,
-              std::uint32_t vertex_count,
-              std::uint32_t instance_count = 1,
-              std::uint32_t first_vertex = 0,
-              std::uint32_t first_instance = 0) noexcept
-    {
-        draw_impl(nullptr, 0, vertex_count, instance_count, first_vertex, first_instance);
-    }
+void bind_pipeline(CommandList* commands, const Pipeline* pipeline) noexcept;
+void set_resource_heap(CommandList* commands, GpuRange heap) noexcept;
+void set_sampler_heap(CommandList* commands, GpuRange heap) noexcept;
+void begin_rendering(CommandList* commands,
+                     Texture* color,
+                     float4 clear_color = {0.0f, 0.0f, 0.0f, 1.0f},
+                     bool clear = true,
+                     Texture* depth = nullptr,
+                     float clear_depth = 1.0f) noexcept;
+void end_rendering(CommandList* commands) noexcept;
+void copy_memory(CommandList* commands,
+                 GpuRange source,
+                 GpuRange destination) noexcept;
+void copy_memory_to_texture(CommandList* commands,
+                            GpuRange source,
+                            Texture* destination) noexcept;
+void copy_texture_to_memory(CommandList* commands,
+                            Texture* source,
+                            GpuRange destination) noexcept;
+void barrier(CommandList* commands,
+             Stage before,
+             Access before_access,
+             Stage after,
+             Access after_access) noexcept;
 
-    template<typename Root>
-    void draw_indexed(const Root* root,
-                      GpuRange indices,
-                      IndexType type,
-                      std::uint32_t index_count,
-                      std::uint32_t instance_count = 1,
-                      std::uint32_t first_index = 0,
-                      std::int32_t vertex_offset = 0,
-                      std::uint32_t first_instance = 0) noexcept
-    {
-        draw_indexed_impl(root, root ? root_data_size<Root>() : 0, indices, type, index_count,
-                          instance_count, first_index, vertex_offset, first_instance);
-    }
+namespace detail
+{
 
-    void draw_indexed(std::nullptr_t,
-                      GpuRange indices,
-                      IndexType type,
-                      std::uint32_t index_count,
-                      std::uint32_t instance_count = 1,
-                      std::uint32_t first_index = 0,
-                      std::int32_t vertex_offset = 0,
-                      std::uint32_t first_instance = 0) noexcept
-    {
-        draw_indexed_impl(nullptr, 0, indices, type, index_count, instance_count,
-                          first_index, vertex_offset, first_instance);
-    }
+template<typename Root>
+[[nodiscard]] consteval std::size_t root_data_size() noexcept
+{
+    static_assert(std::is_standard_layout_v<Root> &&
+                      std::is_trivially_copyable_v<Root>,
+                  "root data must be a standard-layout, trivially copyable type");
+    static_assert(sizeof(Root) % 4 == 0,
+                  "root data size must be a multiple of four bytes");
+    return sizeof(Root);
+}
 
-    template<typename Root>
-    void draw_indirect(const Root* root,
-                       GpuRange arguments,
-                       std::uint32_t draw_count = 1,
-                       std::uint32_t stride = 0) noexcept
-    {
-        draw_indirect_impl(root, root ? root_data_size<Root>() : 0,
-                           arguments, draw_count, stride);
-    }
-
-    void draw_indirect(std::nullptr_t,
-                       GpuRange arguments,
-                       std::uint32_t draw_count = 1,
-                       std::uint32_t stride = 0) noexcept
-    {
-        draw_indirect_impl(nullptr, 0, arguments, draw_count, stride);
-    }
-
-    template<typename Root>
-    void draw_indexed_indirect(const Root* root,
-                               GpuRange indices,
-                               IndexType type,
-                               GpuRange arguments,
-                               std::uint32_t draw_count = 1,
-                               std::uint32_t stride = 0) noexcept
-    {
-        draw_indexed_indirect_impl(root, root ? root_data_size<Root>() : 0, indices, type,
-                                   arguments, draw_count, stride);
-    }
-
-    void draw_indexed_indirect(std::nullptr_t,
-                               GpuRange indices,
-                               IndexType type,
-                               GpuRange arguments,
-                               std::uint32_t draw_count = 1,
-                               std::uint32_t stride = 0) noexcept
-    {
-        draw_indexed_indirect_impl(nullptr, 0, indices, type, arguments,
-                                   draw_count, stride);
-    }
-
-    template<typename Root>
-    void dispatch(const Root* root,
-                  std::uint32_t x,
-                  std::uint32_t y = 1,
-                  std::uint32_t z = 1) noexcept
-    {
-        dispatch_impl(root, root ? root_data_size<Root>() : 0, x, y, z);
-    }
-
-    void dispatch(std::nullptr_t,
-                  std::uint32_t x,
-                  std::uint32_t y = 1,
-                  std::uint32_t z = 1) noexcept
-    {
-        dispatch_impl(nullptr, 0, x, y, z);
-    }
-
-    template<typename Root>
-    void dispatch_indirect(const Root* root, GpuRange arguments) noexcept
-    {
-        dispatch_indirect_impl(root, root ? root_data_size<Root>() : 0, arguments);
-    }
-
-    void dispatch_indirect(std::nullptr_t, GpuRange arguments) noexcept
-    {
-        dispatch_indirect_impl(nullptr, 0, arguments);
-    }
-
-    void copy_memory(GpuRange source, GpuRange destination) noexcept;
-    void copy_memory_to_texture(GpuRange source, Texture& destination) noexcept;
-    void copy_texture_to_memory(Texture& source, GpuRange destination) noexcept;
-
-    void barrier(Stage before, Access before_access,
-                 Stage after, Access after_access) noexcept;
-    [[nodiscard]] Error finish() noexcept;
-    explicit operator bool() const noexcept;
-
-private:
-    struct AddressRange;
-    struct Impl;
-    Impl* impl_ = nullptr;
-    explicit CommandList(Impl* impl) noexcept;
-    template<typename Root>
-    [[nodiscard]] static consteval std::size_t root_data_size() noexcept
-    {
-        static_assert(std::is_standard_layout_v<Root> &&
-                          std::is_trivially_copyable_v<Root>,
-                      "root data must be a standard-layout, trivially copyable type");
-        static_assert(sizeof(Root) % 4 == 0,
-                      "root data size must be a multiple of four bytes");
-        return sizeof(Root);
-    }
-    [[nodiscard]] AddressRange validate_range(GpuRange range) noexcept;
-    [[nodiscard]] bool emit_root_data(const void* data, std::size_t size) noexcept;
-    void draw_impl(const void* root,
+void draw_impl(CommandList* commands,
+               const void* root,
+               std::size_t root_size,
+               std::uint32_t vertex_count,
+               std::uint32_t instance_count,
+               std::uint32_t first_vertex,
+               std::uint32_t first_instance) noexcept;
+void draw_indexed_impl(CommandList* commands,
+                       const void* root,
+                       std::size_t root_size,
+                       GpuRange indices,
+                       IndexType type,
+                       std::uint32_t index_count,
+                       std::uint32_t instance_count,
+                       std::uint32_t first_index,
+                       std::int32_t vertex_offset,
+                       std::uint32_t first_instance) noexcept;
+void draw_indirect_impl(CommandList* commands,
+                        const void* root,
+                        std::size_t root_size,
+                        GpuRange arguments,
+                        std::uint32_t draw_count,
+                        std::uint32_t stride) noexcept;
+void draw_indexed_indirect_impl(CommandList* commands,
+                                const void* root,
+                                std::size_t root_size,
+                                GpuRange indices,
+                                IndexType type,
+                                GpuRange arguments,
+                                std::uint32_t draw_count,
+                                std::uint32_t stride) noexcept;
+void dispatch_impl(CommandList* commands,
+                   const void* root,
                    std::size_t root_size,
-                   std::uint32_t vertex_count,
-                   std::uint32_t instance_count,
-                   std::uint32_t first_vertex,
-                   std::uint32_t first_instance) noexcept;
-    void draw_indexed_impl(const void* root,
-                           std::size_t root_size,
+                   std::uint32_t x,
+                   std::uint32_t y,
+                   std::uint32_t z) noexcept;
+void dispatch_indirect_impl(CommandList* commands,
+                            const void* root,
+                            std::size_t root_size,
+                            GpuRange arguments) noexcept;
+
+} // namespace detail
+
+template<typename Root>
+void draw(CommandList* commands,
+          const Root* root,
+          std::uint32_t vertex_count,
+          std::uint32_t instance_count = 1,
+          std::uint32_t first_vertex = 0,
+          std::uint32_t first_instance = 0) noexcept
+{
+    detail::draw_impl(commands, root, detail::root_data_size<Root>(), vertex_count,
+                      instance_count, first_vertex, first_instance);
+}
+
+inline void draw(CommandList* commands,
+                 std::nullptr_t,
+                 std::uint32_t vertex_count,
+                 std::uint32_t instance_count = 1,
+                 std::uint32_t first_vertex = 0,
+                 std::uint32_t first_instance = 0) noexcept
+{
+    detail::draw_impl(commands, nullptr, 0, vertex_count, instance_count,
+                      first_vertex, first_instance);
+}
+
+template<typename Root>
+void draw_indexed(CommandList* commands,
+                  const Root* root,
+                  GpuRange indices,
+                  IndexType type,
+                  std::uint32_t index_count,
+                  std::uint32_t instance_count = 1,
+                  std::uint32_t first_index = 0,
+                  std::int32_t vertex_offset = 0,
+                  std::uint32_t first_instance = 0) noexcept
+{
+    detail::draw_indexed_impl(commands, root, detail::root_data_size<Root>(),
+                              indices, type, index_count, instance_count,
+                              first_index, vertex_offset, first_instance);
+}
+
+inline void draw_indexed(CommandList* commands,
+                         std::nullptr_t,
+                         GpuRange indices,
+                         IndexType type,
+                         std::uint32_t index_count,
+                         std::uint32_t instance_count = 1,
+                         std::uint32_t first_index = 0,
+                         std::int32_t vertex_offset = 0,
+                         std::uint32_t first_instance = 0) noexcept
+{
+    detail::draw_indexed_impl(commands, nullptr, 0, indices, type, index_count,
+                              instance_count, first_index, vertex_offset, first_instance);
+}
+
+template<typename Root>
+void draw_indirect(CommandList* commands,
+                   const Root* root,
+                   GpuRange arguments,
+                   std::uint32_t draw_count = 1,
+                   std::uint32_t stride = 0) noexcept
+{
+    detail::draw_indirect_impl(commands, root, detail::root_data_size<Root>(),
+                               arguments, draw_count, stride);
+}
+
+inline void draw_indirect(CommandList* commands,
+                          std::nullptr_t,
+                          GpuRange arguments,
+                          std::uint32_t draw_count = 1,
+                          std::uint32_t stride = 0) noexcept
+{
+    detail::draw_indirect_impl(commands, nullptr, 0, arguments, draw_count, stride);
+}
+
+template<typename Root>
+void draw_indexed_indirect(CommandList* commands,
+                           const Root* root,
                            GpuRange indices,
                            IndexType type,
-                           std::uint32_t index_count,
-                           std::uint32_t instance_count,
-                           std::uint32_t first_index,
-                           std::int32_t vertex_offset,
-                           std::uint32_t first_instance) noexcept;
-    void draw_indirect_impl(const void* root,
-                            std::size_t root_size,
-                            GpuRange arguments,
-                            std::uint32_t draw_count,
-                            std::uint32_t stride) noexcept;
-    void draw_indexed_indirect_impl(const void* root,
-                                    std::size_t root_size,
-                                    GpuRange indices,
-                                    IndexType type,
-                                    GpuRange arguments,
-                                    std::uint32_t draw_count,
-                                    std::uint32_t stride) noexcept;
-    void dispatch_impl(const void* root,
-                       std::size_t root_size,
-                       std::uint32_t x,
-                       std::uint32_t y,
-                       std::uint32_t z) noexcept;
-    void dispatch_indirect_impl(const void* root,
-                                std::size_t root_size,
-                                GpuRange arguments) noexcept;
-    void validate_texture(Texture& texture) noexcept;
-    [[nodiscard]] bool require_graphics_pipeline() const noexcept;
-    [[nodiscard]] bool require_compute_pipeline() const noexcept;
-    friend class Device;
-};
-
-class Device
+                           GpuRange arguments,
+                           std::uint32_t draw_count = 1,
+                           std::uint32_t stride = 0) noexcept
 {
-public:
-    Device() noexcept;
-    ~Device() noexcept;
-    Device(Device&&) noexcept;
-    Device& operator=(Device&&) noexcept;
-    Device(const Device&) = delete;
-    Device& operator=(const Device&) = delete;
+    detail::draw_indexed_indirect_impl(
+        commands, root, detail::root_data_size<Root>(), indices, type,
+        arguments, draw_count, stride);
+}
 
-    [[nodiscard]] static Error create(Device& output,
-                                      const DeviceDesc& desc = {}) noexcept;
-    [[nodiscard]] const DeviceCaps& caps() const noexcept;
+inline void draw_indexed_indirect(CommandList* commands,
+                                  std::nullptr_t,
+                                  GpuRange indices,
+                                  IndexType type,
+                                  GpuRange arguments,
+                                  std::uint32_t draw_count = 1,
+                                  std::uint32_t stride = 0) noexcept
+{
+    detail::draw_indexed_indirect_impl(
+        commands, nullptr, 0, indices, type, arguments, draw_count, stride);
+}
 
-    [[nodiscard]] GpuAllocation gpu_malloc(
-        std::uint64_t byte_count,
-        MemoryType memory = MemoryType::default_,
-        std::uint64_t alignment = 16) const noexcept;
+template<typename Root>
+void dispatch(CommandList* commands,
+              const Root* root,
+              std::uint32_t x,
+              std::uint32_t y = 1,
+              std::uint32_t z = 1) noexcept
+{
+    detail::dispatch_impl(commands, root, detail::root_data_size<Root>(), x, y, z);
+}
 
-    template<typename T>
-    [[nodiscard]] GpuAllocation gpu_malloc(
-        std::size_t count = 1,
-        MemoryType memory = MemoryType::default_) const noexcept
-    {
-        static_assert(std::is_object_v<T>, "gpu_malloc<T> requires an object type");
-        if (count > std::numeric_limits<std::uint64_t>::max() / sizeof(T))
-        {
-            assert(false && "gpu_malloc size overflow");
-            std::abort();
-        }
-        constexpr std::uint64_t alignment = alignof(T) > 16 ? alignof(T) : 16;
-        return gpu_malloc(
-            static_cast<std::uint64_t>(count) * sizeof(T), memory, alignment);
-    }
+inline void dispatch(CommandList* commands,
+                     std::nullptr_t,
+                     std::uint32_t x,
+                     std::uint32_t y = 1,
+                     std::uint32_t z = 1) noexcept
+{
+    detail::dispatch_impl(commands, nullptr, 0, x, y, z);
+}
 
-    [[nodiscard]] GpuAllocation gpu_malloc_resource_heap(
-        std::uint64_t byte_count) const noexcept;
-    [[nodiscard]] GpuAllocation gpu_malloc_sampler_heap(
-        std::uint64_t byte_count) const noexcept;
+template<typename Root>
+void dispatch_indirect(CommandList* commands,
+                       const Root* root,
+                       GpuRange arguments) noexcept
+{
+    detail::dispatch_indirect_impl(
+        commands, root, detail::root_data_size<Root>(), arguments);
+}
 
-    void gpu_free(GpuAllocation allocation) const noexcept;
-
-    [[nodiscard]] Error create_texture(Texture& output,
-                                       const TextureDesc& desc) const noexcept;
-    [[nodiscard]] Error write_texture_descriptor(
-        void* cpu_destination,
-        const Texture& texture,
-        TextureDescriptorType type,
-        const TextureViewDesc& view = {}) const noexcept;
-    [[nodiscard]] Error write_sampler_descriptor(
-        void* cpu_destination,
-        const SamplerDesc& desc = {}) const noexcept;
-    [[nodiscard]] Error create_graphics_pipeline(
-        Pipeline& output, const GraphicsPipelineDesc& desc) const noexcept;
-    [[nodiscard]] Error create_compute_pipeline(
-        Pipeline& output, const ComputePipelineDesc& desc) const noexcept;
-    [[nodiscard]] Error begin_commands(CommandList& output) const noexcept;
-    [[nodiscard]] Error submit(CommandList&& commands) const noexcept;
-    [[nodiscard]] Error submit_and_wait(CommandList&& commands) const noexcept;
-    [[nodiscard]] Error wait_idle() const noexcept;
-    explicit operator bool() const noexcept;
-
-private:
-    std::unique_ptr<detail::DeviceState> impl_;
-    explicit Device(std::unique_ptr<detail::DeviceState> impl) noexcept;
-};
+inline void dispatch_indirect(CommandList* commands,
+                              std::nullptr_t,
+                              GpuRange arguments) noexcept
+{
+    detail::dispatch_indirect_impl(commands, nullptr, 0, arguments);
+}
 
 } // namespace gfx

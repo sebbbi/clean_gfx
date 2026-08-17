@@ -45,27 +45,30 @@ no runtime validation option in `DeviceDesc`.
 ## Error model
 
 `clean_gfx` has no C++ exception path and all repository targets are compiled with exception
-handling disabled. The public runtime result is deliberately small:
+handling disabled. `create_device()` is the only recoverable object-creation call because there is
+no initialized device yet. It returns both fields in one POD:
 
 ```cpp
-enum class Error : std::uint8_t
+struct DeviceInit
 {
-    none,
-    unsupported,
-    out_of_device_memory,
-    invalid_shader,
-    device_lost,
-    driver_error,
+    Device* device;
+    Error error;
 };
 ```
 
-Fallible object factories take their output object first and return `Error`; the output remains
-empty on failure. `CommandList::finish()`, `Device::submit()`, `Device::submit_and_wait()`, and
-`Device::wait_idle()` also return `Error`. Incorrect handles, ranges, alignment, state transitions,
-and other programming
-errors are assertions rather than recoverable runtime results. CPU allocation failure is not
-handled. GPU heap exhaustion is reported directly by every GPU allocation entry point as
-`GpuAllocation {nullptr, nullptr, 0}`; a caller that wants to recover tests `gpu_ptr`.
+Textures, pipelines, and command lists are returned directly as opaque pointer handles. A Vulkan
+runtime failure after device creation asserts and aborts; incorrect handles, ranges, alignment,
+state transitions, and other programming errors are assertions as well. CPU allocation failure is
+not handled. GPU heap exhaustion remains the deliberately recoverable allocation case: every GPU
+allocation entry point returns `GpuAllocation {nullptr, nullptr, 0}`, and a caller that wants to
+recover tests `gpu`.
+
+The API consists of free functions in namespace `gfx`. `Device*`, `Texture*`, `Pipeline*`, and
+`CommandList*` are raw opaque handles, not RAII objects. Creation returns a handle and matching
+`destroy_*()` functions release devices, textures, and pipelines explicitly. `submit()` and
+`submit_and_wait()` consume their command-list handle. `destroy_command_list()` is only for
+abandoning a command list without submission; there is no public finish operation. Applications
+destroy their remaining owned handles in reverse creation order.
 
 The repository queries every required feature at runtime rather than inferring support from the
 Vulkan version alone. The canonical dependency expressions are in Khronos's
@@ -75,23 +78,23 @@ Vulkan version alone. The canonical dependency expressions are in Khronos's
 
 | Public operation | Vulkan implementation | Important contract |
 |---|---|---|
-| `Device::create(Device&, ...)` | Enumerates the four extension strings above; queries the full feature chain, memory types, and `VkPhysicalDeviceDescriptorHeapPropertiesEXT`; creates one timeline semaphore and two reusable frame contexts | A device missing any required extension, feature, combined graphics/compute queue, Vulkan 1.4, coherent device-local host-visible memory, or non-host-visible device-local memory is skipped; if none remains, the factory returns `Error::unsupported`. The device is single-threaded. |
-| `Device::gpu_malloc_resource_heap()` / `gpu_malloc_sampler_heap()` | Creates one exact-sized descriptor-capable `VkBuffer` and one dedicated coherent mapped device-memory allocation per call; the private buffer range includes alignment padding and the Vulkan-required hidden reserved suffix | The returned CPU/GPU pointers both name user byte zero and `GpuAllocation::size` is exactly the requested user size. Descriptor heaps do not consume 256 MiB pooled pages. The caller chooses slots, owns the heap, and frees it only after all GPU use completes. |
-| `Device::create_texture(Texture&, ...)` | Creates an optimal-tiled `VkImage` and normally suballocates its memory from a 256 MiB GPU-only image heap; driver-required or over-page allocations use the dedicated-allocation path | It writes no descriptor and submits no initialization work. The next command-list begin batches the sole `UNDEFINED` to `GENERAL` metadata transition for all newly created textures. Only attachment-capable textures create a `VkImageView`. |
-| `Device::write_texture_descriptor(...)` | Calls `vkWriteResourceDescriptorsEXT` for a sampled/storage `VkImageDescriptorInfoEXT` at the caller's CPU destination | The destination is a caller-selected slot in a live resource-heap allocation. `TextureViewDesc::mip_count == 0` means every remaining mip. Both descriptor kinds use `GENERAL`. |
-| `Device::write_sampler_descriptor(...)` | Calls `vkWriteSamplerDescriptorsEXT` from `SamplerDesc` at the caller's CPU destination | The destination is a caller-selected slot in a live sampler-heap allocation. No public sampler object or Vulkan sampler handle is created. |
-| `Device::begin_commands(CommandList&)` | Reuses one of two persistent frame-context command pools and primary command buffers after its timeline value has completed | It does not create a command pool or command buffer. No descriptor heap is bound automatically. At most two contexts can be recording or in flight before reuse waits for completion. |
-| `CommandList::set_resource_heap()` / `set_sampler_heap()` | Calls `vkCmdBindResourceHeapEXT` / `vkCmdBindSamplerHeapEXT` for the supplied `GpuRange`, computing the hidden reserved suffix from device properties | Heap binding is explicit command state. The range must be the unchanged user GPU pointer/size returned by the matching heap allocation so that the computed suffix names actual backing storage. |
-| `CommandList::draw*()` / `dispatch*()` | A typed root pointer pushes `sizeof(Root)` bytes with `vkCmdPushDataEXT`; `nullptr` skips push data. The corresponding Vulkan draw or dispatch follows immediately. | Vulkan copies non-null root bytes while recording, so the CPU root need only remain valid for the method call. Its size must fit `DeviceCaps::max_push_data_size`. A rootless shader declares no `PushConstant` block. There is no separate public push-data command. |
-| Graphics/compute pipeline creation | `VK_PIPELINE_CREATE_2_DESCRIPTOR_HEAP_BIT_EXT` in `VkPipelineCreateFlags2CreateInfo`; `layout = VK_NULL_HANDLE` | Output-first factories return `Error::invalid_shader` for rejected shader modules. Heap-using shaders contain native `SPV_EXT_descriptor_heap` operations and no set/binding decorations. |
-| `Device::gpu_malloc(..., MemoryType::default_)`, `MemoryType::gpu_only`, or `MemoryType::readback`; `gpu_free()` | 256 MiB fully bound universal `VkBuffer` pages, persistent mapping where applicable, `vkGetBufferDeviceAddress`, and pinned [OffsetAllocator](https://github.com/sebbbi/OffsetAllocator) suballocation | Malloc defaults to coherent mapped device-local memory and returns the `GpuAllocation {cpu_ptr, gpu_ptr, size}` POD. Default/readback have both pointers; GPU-only has a null `cpu_ptr`; GPU exhaustion returns the all-zero null POD. Free requires the unchanged POD. |
-| `CommandList::draw_indexed()` | `vkCmdBindIndexBuffer3KHR`, then `vkCmdDrawIndexed` | The supplied raw `GpuRange` is passed as the address range; its 2/4-byte alignment and draw bounds are asserted, but no allocation is looked up or retained. |
-| `CommandList::draw_indirect()` / `draw_indexed_indirect()` | `vkCmdDrawIndirect2KHR` / `vkCmdDrawIndexedIndirect2KHR`; the indexed form first calls `vkCmdBindIndexBuffer3KHR` | Raw `GpuRange` operands are passed directly; argument address and stride are four-byte aligned, and the caller guarantees allocation bounds/lifetime. |
-| `CommandList::dispatch_indirect()` | `vkCmdDispatchIndirect2KHR` | The raw range must cover one dispatch command and be four-byte aligned; it is not retained. |
-| `CommandList::copy_memory()`, `copy_memory_to_texture()`, `copy_texture_to_memory()` | `vkCmdCopyMemoryKHR`, `vkCmdCopyMemoryToImageKHR`, `vkCmdCopyImageToMemoryKHR` | Each memory operand is a raw `GpuRange`; every image operand uses `GENERAL`. |
-| `CommandList::barrier()` | `vkCmdPipelineBarrier2` with a global memory barrier | Callers synchronize actual hazards without naming an image layout. Incompatible stage/access pairs assert. `Access::descriptor_read` maps to both heap-read access bits. |
-| `Device::submit()` | Ends the command buffer if needed and submits with `vkQueueSubmit2`, signaling the device timeline | Returns after queueing without waiting. The frame context becomes reusable only after its timeline value completes. |
-| `Device::submit_and_wait()` | Performs the same timeline submission, waits for that value, and resets every completed frame pool | Synchronous convenience path; completion covers all earlier queue submissions and pool reset releases their descriptor-heap reserved ranges. No per-submit fence is created. |
+| `create_device()` | Enumerates the four extension strings above; queries the full feature chain, memory types, and `VkPhysicalDeviceDescriptorHeapPropertiesEXT`; creates one timeline semaphore and two reusable frame contexts | A device missing any required extension, feature, combined graphics/compute queue, Vulkan 1.4, coherent device-local host-visible memory, or non-host-visible device-local memory is skipped; if none remains, `DeviceInit::error` is `Error::unsupported`. The device is single-threaded. |
+| `gpu_malloc_resource_heap()` / `gpu_malloc_sampler_heap()` | Creates one exact-sized descriptor-capable `VkBuffer` and one dedicated coherent mapped device-memory allocation per call; the private buffer range includes alignment padding and the Vulkan-required hidden reserved suffix | The returned CPU/GPU pointers both name user byte zero and `GpuAllocation::size` is exactly the requested user size. Descriptor heaps do not consume 256 MiB pooled pages. The caller chooses slots, owns the heap, and frees it only after all GPU use completes. |
+| `create_texture()` | Creates an optimal-tiled `VkImage` and normally suballocates its memory from a 256 MiB GPU-only image heap; driver-required or over-page allocations use the dedicated-allocation path | It writes no descriptor and submits no initialization work. The next command-list begin batches the sole `UNDEFINED` to `GENERAL` metadata transition for all newly created textures. Only attachment-capable textures create a `VkImageView`. |
+| `write_texture_descriptor()` | Calls `vkWriteResourceDescriptorsEXT` for a sampled/storage `VkImageDescriptorInfoEXT` at the caller's CPU destination | The destination is a caller-selected slot in a live resource-heap allocation. `TextureViewDesc::mip_count == 0` means every remaining mip. Both descriptor kinds use `GENERAL`. |
+| `write_sampler_descriptor()` | Calls `vkWriteSamplerDescriptorsEXT` from `SamplerDesc` at the caller's CPU destination | The destination is a caller-selected slot in a live sampler-heap allocation. No public sampler object or Vulkan sampler handle is created. |
+| `begin_commands()` | Reuses one of two persistent frame-context command pools and primary command buffers after its timeline value has completed | It returns a `CommandList*`; it does not create a command pool or command buffer. No descriptor heap is bound automatically. At most two contexts can be recording or in flight before reuse waits for completion. |
+| `set_resource_heap()` / `set_sampler_heap()` | Calls `vkCmdBindResourceHeapEXT` / `vkCmdBindSamplerHeapEXT` for the supplied `GpuRange`, computing the hidden reserved suffix from device properties | Heap binding is explicit command state. The range must be the unchanged user GPU pointer/size returned by the matching heap allocation so that the computed suffix names actual backing storage. |
+| `draw*()` / `dispatch*()` | A typed root pointer pushes `sizeof(Root)` bytes with `vkCmdPushDataEXT`; `nullptr` skips push data. The corresponding Vulkan draw or dispatch follows immediately. | Vulkan copies non-null root bytes while recording, so the CPU root need only remain valid for the function call. Its size must fit `DeviceCaps::max_push_data_size`. A rootless shader declares no `PushConstant` block. There is no separate public push-data command. |
+| `create_graphics_pipeline()` / `create_compute_pipeline()` | `VK_PIPELINE_CREATE_2_DESCRIPTOR_HEAP_BIT_EXT` in `VkPipelineCreateFlags2CreateInfo`; `layout = VK_NULL_HANDLE` | The functions return opaque `Pipeline*` handles directly. Invalid shader modules and later Vulkan failures assert and abort. Heap-using shaders contain native `SPV_EXT_descriptor_heap` operations and no set/binding decorations. |
+| `gpu_malloc(..., MemoryType::default_)`, `MemoryType::gpu_only`, or `MemoryType::readback`; `gpu_free()` | 256 MiB fully bound universal `VkBuffer` pages, persistent mapping where applicable, `vkGetBufferDeviceAddress`, and pinned [OffsetAllocator](https://github.com/sebbbi/OffsetAllocator) suballocation | Malloc defaults to coherent mapped device-local memory and returns the `GpuAllocation<T> {cpu, gpu, size}` POD. Default/readback have both pointers; GPU-only has a null `cpu`; GPU exhaustion returns the all-zero null POD. Free requires the unchanged POD. |
+| `draw_indexed()` | `vkCmdBindIndexBuffer3KHR`, then `vkCmdDrawIndexed` | The supplied raw `GpuRange` is passed as the address range; its 2/4-byte alignment and draw bounds are asserted, but no allocation is looked up or retained. |
+| `draw_indirect()` / `draw_indexed_indirect()` | `vkCmdDrawIndirect2KHR` / `vkCmdDrawIndexedIndirect2KHR`; the indexed form first calls `vkCmdBindIndexBuffer3KHR` | Raw `GpuRange` operands are passed directly; argument address and stride are four-byte aligned, and the caller guarantees allocation bounds/lifetime. |
+| `dispatch_indirect()` | `vkCmdDispatchIndirect2KHR` | The raw range must cover one dispatch command and be four-byte aligned; it is not retained. |
+| `copy_memory()`, `copy_memory_to_texture()`, `copy_texture_to_memory()` | `vkCmdCopyMemoryKHR`, `vkCmdCopyMemoryToImageKHR`, `vkCmdCopyImageToMemoryKHR` | Each memory operand is a raw `GpuRange`; every image operand uses `GENERAL`. |
+| `barrier()` | `vkCmdPipelineBarrier2` with a global memory barrier | Callers synchronize actual hazards without naming an image layout. Incompatible stage/access pairs assert. `Access::descriptor_read` maps to both heap-read access bits. |
+| `submit()` | Ends the command buffer if needed and submits with `vkQueueSubmit2`, signaling the device timeline | Consumes the `CommandList*` and returns after queueing without waiting. The frame context becomes reusable only after its timeline value completes. |
+| `submit_and_wait()` | Performs the same timeline submission, waits for that value, and resets every completed frame pool | Consumes the `CommandList*`. Completion covers all earlier queue submissions and pool reset releases their descriptor-heap reserved ranges. No per-submit fence is created. |
 
 All descriptors, dynamic-rendering attachments, and copy operands name `VK_IMAGE_LAYOUT_GENERAL`.
 Vulkan still requires a newly created image to start in `VK_IMAGE_LAYOUT_UNDEFINED` and transition
@@ -105,23 +108,25 @@ The public memory surface is exactly two trivial, standard-layout aggregates:
 ```cpp
 struct GpuRange
 {
-    void* gpu_ptr;
+    void* gpu;
     std::uint64_t size;
 };
 
+template<typename T = std::byte>
 struct GpuAllocation
 {
-    void* cpu_ptr;
-    void* gpu_ptr;
+    T* cpu;
+    T* gpu;
     std::uint64_t size;
 };
 ```
 
-There are no constructors, destructors, ownership methods, or PIMPL state in either type.
-`gpu_malloc()` returns `GpuAllocation`, `gpu_free()` consumes the unchanged value, and every public
-operation that needs a Vulkan address-plus-size pair consumes `GpuRange`. GPU memory exhaustion
-returns the canonical null allocation with both pointers and size zero. A successful GPU-only
-allocation has a null `cpu_ptr`, so allocation success is determined from `gpu_ptr`.
+Both types are trivial standard-layout PODs with no ownership behavior.
+`gpu_malloc<T>()` returns `GpuAllocation<T>`, `gpu_free()` consumes the unchanged value, and every
+public operation that needs a Vulkan address-plus-size pair consumes `GpuRange`. `gpu_range()`
+converts an allocation to its complete range. GPU memory exhaustion returns the canonical null
+allocation with both pointers and size zero. A successful GPU-only allocation has a null `cpu`, so
+allocation success is determined from `gpu`.
 
 Command recording performs no address-to-allocation lookup and command lists retain no allocation
 records. Address commands consume the numeric pointer and size directly. The caller guarantees that
@@ -177,8 +182,8 @@ are never mapped. This is enforced independently from the coherent device-local 
 default allocations, readback, and descriptor-heap storage.
 
 All device, allocation, descriptor, command-recording, and submission state is deliberately
-single-threaded. The implementation uses no mutexes or atomic counters. Calling methods on one
-device concurrently, including nominally `const` methods, is outside the API contract.
+single-threaded. The implementation uses no mutexes or atomic counters. Calling functions on one
+device concurrently is outside the API contract.
 
 ## Descriptor-heap and root-data model
 
@@ -193,21 +198,21 @@ reported alignments and limits. The normative rules are in the
 
 The application passes `N * DeviceCaps::image_descriptor_size` bytes to
 `gpu_malloc_resource_heap()`, or `N * DeviceCaps::sampler_descriptor_size` bytes to
-`gpu_malloc_sampler_heap()`. The returned `cpu_ptr`, `gpu_ptr`, and `size` describe only those `N`
+`gpu_malloc_sampler_heap()`. The returned `cpu`, `gpu`, and `size` describe only those `N`
 user slots. Each dedicated backing buffer appends the required reserved bytes as an
 implementation-owned suffix. Consequently application slot zero is exactly the returned pointer
 and shader index zero; there is no reserved-prefix index adjustment.
 
-`Device::write_texture_descriptor()` accepts a caller-selected CPU destination, a live `Texture`,
+`write_texture_descriptor()` accepts a caller-selected CPU destination, a live `Texture*`,
 `TextureDescriptorType::sampled` or `storage`, and an optional `TextureViewDesc`. It writes one
-device-sized image descriptor directly at that address. `Device::write_sampler_descriptor()` does
+device-sized image descriptor directly at that address. `write_sampler_descriptor()` does
 the same for a `SamplerDesc`; there is no public `Sampler` handle. Applications can arrange slots,
 contiguous tables, and multiple texture views freely.
 
-`CommandList::set_resource_heap()` and `set_sampler_heap()` explicitly bind the application
-allocations. The supplied `GpuRange` uses the unchanged user `gpu_ptr` and `size`; the backend
+`set_resource_heap()` and `set_sampler_heap()` explicitly bind the application allocations. The
+supplied `GpuRange` uses the unchanged user `gpu` and `size`; the backend
 computes the reserved suffix offset and size from device properties for `VkBindHeapInfoEXT`. Neither
-heap is created or selected by `Device::begin_commands()`.
+heap is created or selected by `begin_commands()`.
 
 Descriptors are written into coherent device-local mapped storage. The runtime rejects devices
 without a `DEVICE_LOCAL | HOST_VISIBLE | HOST_COHERENT` memory type, so explicit mapped-range flushes
@@ -229,11 +234,12 @@ command-buffer push data. The CPU root therefore requires no GPU allocation and 
 that call. GPU pointer fields must not be dereferenced by the CPU,
 and the allocations they name must remain alive through GPU completion. A root can mix typed BDA
 pointers, `uint32` texture/sampler indices, and 32-bit scalar/vector/matrix values. Slang shaders
-sharing C++ POD structures use `-fvk-use-c-layout`; shaders sharing matrix PODs additionally use
-`-matrix-layout-row-major`. `shader_types.h` supplies compact row-major `float2x2`, `float3x3`,
-`float4x4`, and `float3x4` C++ PODs matching Slang's row-by-column names. The triangle is rootless.
+sharing C++ POD structures use `-fvk-use-c-layout`; shaders sharing `float3x4` additionally use
+`-matrix-layout-row-major`. `shader_types.h` supplies one compact row-major `float3x4` C++ POD,
+matching Slang's row-by-column name with three `float4` rows. The triangle is rootless.
 The cube root contains a typed vertex pointer, one user-chosen resource index, explicit padding,
-and a `float4x4` transform. Sampler selection uses the shared `CubeSampler` enum rather than a root
+a `float3x4` clip transform, and two depth coefficients. Sampler selection uses the shared
+`CubeSampler` enum rather than a root
 field. Its four values `wrap_linear`, `wrap_point`, `clamp_linear`, and `clamp_point` map to sampler
 slots 0 through 3.
 
@@ -260,12 +266,13 @@ selects the next context, waits only when that context's earlier timeline value 
 resets its persistent pool, and begins its existing command buffer. It does not allocate or destroy
 a pool or command buffer per recording.
 
-`Device::submit()` ends recording when necessary and queues the command buffer with `vkQueueSubmit2`,
-signaling a monotonically increasing value on the device's timeline semaphore. It returns after the
-queue submission, without waiting for execution. `submit_and_wait()` performs the same submission
-and then waits for that value. It resets all completed frame pools after the wait. No per-submit
-`VkFence` is created. `wait_idle()` remains the explicit whole-device completion point and likewise
-resets inactive frame pools before returning.
+`submit()` ends recording when necessary, consumes the `CommandList*`, and queues the command buffer
+with `vkQueueSubmit2`, signaling a monotonically increasing value on the device's timeline
+semaphore. It returns after the queue submission, without waiting for execution.
+`submit_and_wait()` consumes its command list, performs the same submission, and then waits for that
+value. It resets all completed frame pools after the wait. No per-submit `VkFence` is created.
+`wait_idle()` remains the explicit whole-device completion point and likewise resets inactive frame
+pools before returning.
 
 The two contexts permit two submissions to be in flight before context reuse can wait. They are an
 internal command-memory lifecycle mechanism, not resource lifetime tracking: recording or submission

@@ -15,7 +15,6 @@
 #include <cstring>
 #include <iostream>
 #include <numbers>
-#include <utility>
 #include <vector>
 
 #if defined(_WIN32)
@@ -188,17 +187,25 @@ Matrix look_at(float3 eye, float3 center, float3 up) noexcept
     return result;
 }
 
-void copy_matrix(float4x4& destination, const Matrix& source) noexcept
+float3x4 shader_matrix(const Matrix& source) noexcept
 {
-    for (std::uint32_t row = 0; row != 4; ++row)
+    float3x4 result{};
+    for (std::uint32_t row = 0; row != 2; ++row)
     {
-        destination.rows[row] = {
+        result.rows[row] = {
             source.element[0][row],
             source.element[1][row],
             source.element[2][row],
             source.element[3][row],
         };
     }
+    result.rows[2] = {
+        source.element[0][3],
+        source.element[1][3],
+        source.element[2][3],
+        source.element[3][3],
+    };
+    return result;
 }
 
 #if defined(_WIN32)
@@ -220,13 +227,13 @@ int base64_value(char character) noexcept
     return -1;
 }
 
-bool decode_base64(std::vector<std::byte>& output) noexcept
+std::vector<std::byte> decode_base64() noexcept
 {
     constexpr std::size_t length = sizeof(lunarg_logo_png_base64) - 1;
     if (length == 0 || length % 4 != 0)
-        return false;
+        return {};
 
-    output.clear();
+    std::vector<std::byte> output;
     output.reserve(length / 4 * 3);
     for (std::size_t offset = 0; offset != length; offset += 4)
     {
@@ -238,19 +245,19 @@ bool decode_base64(std::vector<std::byte>& output) noexcept
         if (a < 0 || b < 0 || c == -1 || d == -1 ||
             (c == -2 && d != -2) ||
             ((c == -2 || d == -2) && !last_group))
-            return false;
+            return {};
 
-        const auto bits = (static_cast<std::uint32_t>(a) << 18u) |
-                          (static_cast<std::uint32_t>(b) << 12u) |
-                          (static_cast<std::uint32_t>(c < 0 ? 0 : c) << 6u) |
-                          static_cast<std::uint32_t>(d < 0 ? 0 : d);
+        const std::uint32_t bits = (static_cast<std::uint32_t>(a) << 18u) |
+                                   (static_cast<std::uint32_t>(b) << 12u) |
+                                   (static_cast<std::uint32_t>(c < 0 ? 0 : c) << 6u) |
+                                   static_cast<std::uint32_t>(d < 0 ? 0 : d);
         output.push_back(static_cast<std::byte>((bits >> 16u) & 0xffu));
         if (c != -2)
             output.push_back(static_cast<std::byte>((bits >> 8u) & 0xffu));
         if (d != -2)
             output.push_back(static_cast<std::byte>(bits & 0xffu));
     }
-    return true;
+    return output;
 }
 
 template<typename T>
@@ -261,11 +268,13 @@ void release_com(T*& object) noexcept
     object = nullptr;
 }
 
-bool make_texture(std::vector<std::byte>& pixels) noexcept
+std::vector<std::byte> make_texture() noexcept
 {
-    std::vector<std::byte> png;
-    if (!decode_base64(png))
-        return false;
+    std::vector<std::byte> png = decode_base64();
+    if (png.empty())
+        return {};
+
+    std::vector<std::byte> pixels;
 
     const HRESULT initialize_result =
         CoInitializeEx(nullptr, COINIT_MULTITHREADED);
@@ -336,13 +345,16 @@ bool make_texture(std::vector<std::byte>& pixels) noexcept
     release_com(factory);
     if (uninitialize)
         CoUninitialize();
-    return SUCCEEDED(result);
+    if (FAILED(result))
+        return {};
+    return pixels;
 }
 
 #else
 
-bool make_texture(std::vector<std::byte>& pixels)
+std::vector<std::byte> make_texture() noexcept
 {
+    std::vector<std::byte> pixels;
     pixels.resize(
         static_cast<std::size_t>(texture_width) * texture_height * 4);
     for (std::uint32_t y = 0; y != texture_height; ++y)
@@ -370,7 +382,7 @@ bool make_texture(std::vector<std::byte>& pixels)
                 blue = 36u;
             }
 
-            const auto offset =
+            const std::size_t offset =
                 (static_cast<std::size_t>(y) * texture_width + x) * 4;
             pixels[offset + 0] = static_cast<std::byte>(red);
             pixels[offset + 1] = static_cast<std::byte>(green);
@@ -378,47 +390,45 @@ bool make_texture(std::vector<std::byte>& pixels)
             pixels[offset + 3] = static_cast<std::byte>(255u);
         }
     }
-    return true;
+    return pixels;
 }
 
 #endif
 
-bool render_frame(const gfx::Device& device,
-                  const gfx::Pipeline& pipeline,
-                  gfx::Texture& target,
-                  gfx::Texture& depth,
+void render_frame(gfx::Device* device,
+                  gfx::Pipeline* pipeline,
+                  gfx::Texture* target,
+                  gfx::Texture* depth,
                   gfx::GpuRange resource_heap,
                   gfx::GpuRange sampler_heap,
                   const CubeRootArguments& root,
-                  gfx::GpuAllocation readback) noexcept
+                  gfx::GpuAllocation<std::byte> readback) noexcept
 {
-    gfx::CommandList commands;
-    if (!gfx_succeeded(device.begin_commands(commands), application_name,
-                       "begin frame commands"))
-        return false;
-
-    commands.barrier(gfx::Stage::transfer | gfx::Stage::depth_tests,
-                     gfx::Access::transfer_read | gfx::Access::depth_write,
-                     gfx::Stage::color_output | gfx::Stage::depth_tests,
-                     gfx::Access::color_write | gfx::Access::depth_write);
-    commands.set_resource_heap(resource_heap);
-    commands.set_sampler_heap(sampler_heap);
-    commands.begin_rendering(target, {0.2f, 0.2f, 0.2f, 0.2f}, true, &depth, 1.0f);
-    commands.bind_pipeline(pipeline);
-    commands.draw(&root, static_cast<std::uint32_t>(cube_vertices.size()));
-    commands.end_rendering();
-    commands.barrier(gfx::Stage::color_output,
-                     gfx::Access::color_write,
-                     gfx::Stage::transfer,
-                     gfx::Access::transfer_read);
-    commands.copy_texture_to_memory(
-        target, {readback.gpu_ptr, readback.size});
-    commands.barrier(gfx::Stage::transfer,
-                     gfx::Access::transfer_write,
-                     gfx::Stage::host,
-                     gfx::Access::host_read);
-    return gfx_succeeded(device.submit_and_wait(std::move(commands)),
-                         application_name, "submit frame");
+    gfx::CommandList* commands = gfx::begin_commands(device);
+    gfx::barrier(commands,
+                 gfx::Stage::transfer | gfx::Stage::depth_tests,
+                 gfx::Access::transfer_read | gfx::Access::depth_write,
+                 gfx::Stage::color_output | gfx::Stage::depth_tests,
+                 gfx::Access::color_write | gfx::Access::depth_write);
+    gfx::set_resource_heap(commands, resource_heap);
+    gfx::set_sampler_heap(commands, sampler_heap);
+    gfx::begin_rendering(
+        commands, target, {0.2f, 0.2f, 0.2f, 0.2f}, true, depth, 1.0f);
+    gfx::bind_pipeline(commands, pipeline);
+    gfx::draw(commands, &root, static_cast<std::uint32_t>(cube_vertices.size()));
+    gfx::end_rendering(commands);
+    gfx::barrier(commands,
+                 gfx::Stage::color_output,
+                 gfx::Access::color_write,
+                 gfx::Stage::transfer,
+                 gfx::Access::transfer_read);
+    gfx::copy_texture_to_memory(commands, target, gfx::gpu_range(readback));
+    gfx::barrier(commands,
+                 gfx::Stage::transfer,
+                 gfx::Access::transfer_write,
+                 gfx::Stage::host,
+                 gfx::Access::host_read);
+    gfx::submit_and_wait(device, commands);
 }
 
 } // namespace
@@ -434,56 +444,67 @@ int main(int argc, char** argv)
         return 1;
     }
 
-    gfx::Device device;
-    if (!gfx_succeeded(
-            gfx::Device::create(device, {.application_name = application_name}),
-            application_name, "create device"))
-        return 1;
-    std::cout << "Using " << device.caps().device_name << '\n';
-
-    const auto resource_heap_size = device.caps().image_descriptor_size;
-    const auto sampler_heap_size =
-        device.caps().sampler_descriptor_size *
-        static_cast<std::uint32_t>(CubeSampler::count);
-    auto resource_heap = device.gpu_malloc_resource_heap(resource_heap_size);
-    auto sampler_heap = device.gpu_malloc_sampler_heap(sampler_heap_size);
-
-    auto vertex_memory = device.gpu_malloc<CubeVertex>(cube_vertices.size());
-    std::memcpy(vertex_memory.cpu_ptr, cube_vertices.data(), sizeof(cube_vertices));
-
-    std::vector<std::byte> texture_pixels;
-    if (!make_texture(texture_pixels))
+    const std::vector<std::byte> texture_pixels = make_texture();
+    if (texture_pixels.empty())
     {
         std::cerr << application_name << ": could not decode embedded cube texture\n";
         return 1;
     }
-    auto texture_upload = device.gpu_malloc<std::byte>(texture_pixels.size());
-    std::memcpy(texture_upload.cpu_ptr, texture_pixels.data(), texture_pixels.size());
 
-    gfx::Texture texture;
-    if (!gfx_succeeded(
-            device.create_texture(
-                texture,
-                {
-                    .width = texture_width,
-                    .height = texture_height,
-                    .depth = 1,
-                    .mip_levels = 1,
-                    .format = gfx::Format::rgba8_srgb,
-                    .usage = gfx::TextureUsage::sampled |
-                             gfx::TextureUsage::transfer_destination,
-                    .name = "cube texture",
-                }),
-            application_name, "create cube texture"))
+    const std::vector<std::uint32_t> vertex_spirv =
+        read_spirv(application_name, CLEAN_GFX_CUBE_VERTEX_SPV_PATH);
+    const std::vector<std::uint32_t> fragment_spirv =
+        read_spirv(application_name, CLEAN_GFX_CUBE_FRAGMENT_SPV_PATH);
+    if (vertex_spirv.empty() || fragment_spirv.empty())
         return 1;
 
-    if (!gfx_succeeded(
-            device.write_texture_descriptor(
-                resource_heap.cpu_ptr,
-                texture,
-                gfx::TextureDescriptorType::sampled),
-            application_name, "write cube texture descriptor"))
+    const gfx::DeviceInit device_init = gfx::create_device({
+        .application_name = application_name,
+    });
+    if (device_init.error != gfx::Error::none)
+    {
+        std::cerr << application_name << ": create device: "
+                  << gfx_error_name(device_init.error) << '\n';
         return 1;
+    }
+    gfx::Device* device = device_init.device;
+    const gfx::DeviceCaps caps = gfx::get_device_caps(device);
+    std::cout << "Using " << caps.device_name << '\n';
+
+    const std::uint64_t resource_heap_size = caps.image_descriptor_size;
+    const std::uint64_t sampler_heap_size =
+        caps.sampler_descriptor_size *
+        static_cast<std::uint32_t>(CubeSampler::count);
+    gfx::GpuAllocation<std::byte> resource_heap =
+        gfx::gpu_malloc_resource_heap(device, resource_heap_size);
+    gfx::GpuAllocation<std::byte> sampler_heap =
+        gfx::gpu_malloc_sampler_heap(device, sampler_heap_size);
+
+    gfx::GpuAllocation<CubeVertex> vertex_memory =
+        gfx::gpu_malloc<CubeVertex>(device, cube_vertices.size());
+    std::memcpy(vertex_memory.cpu, cube_vertices.data(), sizeof(cube_vertices));
+
+    gfx::GpuAllocation<std::byte> texture_upload =
+        gfx::gpu_malloc<std::byte>(device, texture_pixels.size());
+    std::memcpy(texture_upload.cpu, texture_pixels.data(), texture_pixels.size());
+
+    gfx::Texture* texture = gfx::create_texture(
+        device,
+        {
+            .width = texture_width,
+            .height = texture_height,
+            .depth = 1,
+            .mip_levels = 1,
+            .format = gfx::Format::rgba8_srgb,
+            .usage = gfx::TextureUsage::sampled |
+                     gfx::TextureUsage::transfer_destination,
+            .name = "cube texture",
+        });
+
+    gfx::write_texture_descriptor(device,
+                                  resource_heap.cpu,
+                                  texture,
+                                  gfx::TextureDescriptorType::sampled);
 
     const std::array<gfx::SamplerDesc,
                      static_cast<std::size_t>(CubeSampler::count)> sampler_descs{{
@@ -505,95 +526,70 @@ int main(int argc, char** argv)
             .address_w = gfx::AddressMode::clamp_to_edge,
         },
     }};
-    auto* sampler_descriptors = static_cast<std::byte*>(sampler_heap.cpu_ptr);
+    std::byte* sampler_descriptors = sampler_heap.cpu;
     for (std::size_t index = 0; index < sampler_descs.size(); ++index)
     {
-        if (!gfx_succeeded(
-                device.write_sampler_descriptor(
-                    sampler_descriptors + index * device.caps().sampler_descriptor_size,
-                    sampler_descs[index]),
-                application_name, "write cube sampler descriptor"))
-            return 1;
+        gfx::write_sampler_descriptor(
+            device,
+            sampler_descriptors + index * caps.sampler_descriptor_size,
+            sampler_descs[index]);
     }
 
-    gfx::Texture target;
-    if (!gfx_succeeded(
-            device.create_texture(
-                target,
-                {
-                    .width = width,
-                    .height = height,
-                    .depth = 1,
-                    .mip_levels = 1,
-                    .format = gfx::Format::bgra8_unorm,
-                    .usage = gfx::TextureUsage::color_attachment |
-                             gfx::TextureUsage::transfer_source,
-                    .name = "cube color target",
-                }),
-            application_name, "create color target"))
-        return 1;
+    gfx::Texture* target = gfx::create_texture(
+        device,
+        {
+            .width = width,
+            .height = height,
+            .depth = 1,
+            .mip_levels = 1,
+            .format = gfx::Format::bgra8_unorm,
+            .usage = gfx::TextureUsage::color_attachment |
+                     gfx::TextureUsage::transfer_source,
+            .name = "cube color target",
+        });
 
-    gfx::Texture depth;
-    if (!gfx_succeeded(
-            device.create_texture(
-                depth,
-                {
-                    .width = width,
-                    .height = height,
-                    .depth = 1,
-                    .mip_levels = 1,
-                    .format = gfx::Format::d32_float,
-                    .usage = gfx::TextureUsage::depth_attachment,
-                    .name = "cube depth target",
-                }),
-            application_name, "create depth target"))
-        return 1;
+    gfx::Texture* depth = gfx::create_texture(
+        device,
+        {
+            .width = width,
+            .height = height,
+            .depth = 1,
+            .mip_levels = 1,
+            .format = gfx::Format::d32_float,
+            .usage = gfx::TextureUsage::depth_attachment,
+            .name = "cube depth target",
+        });
 
-    auto readback = device.gpu_malloc<std::byte>(
+    gfx::GpuAllocation<std::byte> readback = gfx::gpu_malloc<std::byte>(
+        device,
         static_cast<std::uint64_t>(width) * height * 4,
         gfx::MemoryType::readback);
 
-    std::vector<std::uint32_t> vertex_spirv;
-    std::vector<std::uint32_t> fragment_spirv;
-    if (!read_spirv(application_name, CLEAN_GFX_CUBE_VERTEX_SPV_PATH,
-                    vertex_spirv) ||
-        !read_spirv(application_name, CLEAN_GFX_CUBE_FRAGMENT_SPV_PATH,
-                    fragment_spirv))
-        return 1;
+    gfx::Pipeline* pipeline = gfx::create_graphics_pipeline(
+        device,
+        {
+            .vertex_spirv = vertex_spirv,
+            .fragment_spirv = fragment_spirv,
+            .color_format = gfx::Format::bgra8_unorm,
+            .depth_format = gfx::Format::d32_float,
+            .depth_enabled = true,
+            .depth_write = true,
+            .topology = gfx::PrimitiveTopology::triangle_list,
+            .cull = gfx::CullMode::clockwise,
+            .name = "cube pipeline",
+        });
 
-    gfx::Pipeline pipeline;
-    if (!gfx_succeeded(
-            device.create_graphics_pipeline(
-                pipeline,
-                {
-                    .vertex_spirv = vertex_spirv,
-                    .fragment_spirv = fragment_spirv,
-                    .color_format = gfx::Format::bgra8_unorm,
-                    .depth_format = gfx::Format::d32_float,
-                    .depth_enabled = true,
-                    .depth_write = true,
-                    .topology = gfx::PrimitiveTopology::triangle_list,
-                    .cull = gfx::CullMode::clockwise,
-                    .name = "cube pipeline",
-                }),
-            application_name, "create graphics pipeline"))
-        return 1;
-
-    gfx::CommandList upload_commands;
-    if (!gfx_succeeded(device.begin_commands(upload_commands), application_name,
-                       "begin texture upload"))
-        return 1;
-    upload_commands.copy_memory_to_texture(
-        {texture_upload.gpu_ptr, texture_upload.size}, texture);
-    upload_commands.barrier(
+    gfx::CommandList* upload_commands = gfx::begin_commands(device);
+    gfx::copy_memory_to_texture(
+        upload_commands, gfx::gpu_range(texture_upload), texture);
+    gfx::barrier(
+        upload_commands,
         gfx::Stage::transfer | gfx::Stage::host,
         gfx::Access::transfer_write | gfx::Access::host_write,
         gfx::Stage::vertex | gfx::Stage::fragment,
         gfx::Access::shader_read | gfx::Access::descriptor_read);
-    if (!gfx_succeeded(device.submit_and_wait(std::move(upload_commands)),
-                       application_name, "submit texture upload"))
-        return 1;
-    device.gpu_free(texture_upload);
+    gfx::submit_and_wait(device, upload_commands);
+    gfx::gpu_free(device, texture_upload);
 
     const Matrix view = look_at({0.0f, 3.0f, 5.0f},
                                 {0.0f, 0.0f, 0.0f},
@@ -604,61 +600,71 @@ int main(int argc, char** argv)
         0.1f,
         100.0f);
 
-    ExampleWindow window;
-    if (!output_path && !open_example_window(window, "clean_gfx spinning textured cube",
-                                              width, height))
+    ExampleWindow window = output_path
+                               ? ExampleWindow{}
+                               : open_example_window(
+                                     "clean_gfx spinning textured cube", width, height);
+    bool succeeded = output_path || window.running;
+    if (!succeeded)
     {
         std::cerr << application_name << ": could not open window\n";
-        return 1;
     }
 
     std::uint64_t frame_index = 0;
-    bool succeeded = true;
-    do
+    if (succeeded)
     {
-        ++frame_index;
-        CubeRootArguments root{
-            .vertices = static_cast<CubeVertex*>(vertex_memory.gpu_ptr),
-            .texture_index = 0,
-        };
-        const Matrix model = rotation_y(
-            radians_per_frame * static_cast<float>(frame_index));
-        const Matrix mvp = multiply(projection, multiply(view, model));
-        copy_matrix(root.mvp, mvp);
-
-        succeeded = render_frame(
-            device,
-            pipeline,
-            target,
-            depth,
-            {resource_heap.gpu_ptr, resource_heap.size},
-            {sampler_heap.gpu_ptr, sampler_heap.size},
-            root,
-            readback);
-        if (!succeeded)
-            break;
-
-        const auto* pixels = static_cast<const std::byte*>(readback.cpu_ptr);
-        if (output_path)
+        do
         {
-            succeeded = write_bgra8_ppm(
-                application_name, output_path, pixels, width, height);
-            if (succeeded)
-                std::cout << "Wrote " << output_path << '\n';
-            break;
-        }
-        succeeded = present_bgra8(window, pixels, width, height);
+            ++frame_index;
+            const Matrix model = rotation_y(
+                radians_per_frame * static_cast<float>(frame_index));
+            const Matrix mvp = multiply(projection, multiply(view, model));
+            const CubeRootArguments root{
+                .vertices = vertex_memory.gpu,
+                .texture_index = 0,
+                .transform = shader_matrix(mvp),
+                .depth_transform = {
+                    -projection.element[2][2],
+                    projection.element[3][2],
+                },
+            };
+
+            render_frame(device,
+                         pipeline,
+                         target,
+                         depth,
+                         gfx::gpu_range(resource_heap),
+                         gfx::gpu_range(sampler_heap),
+                         root,
+                         readback);
+
+            const std::byte* pixels = readback.cpu;
+            if (output_path)
+            {
+                succeeded = write_bgra8_ppm(
+                    application_name, output_path, pixels, width, height);
+                if (succeeded)
+                    std::cout << "Wrote " << output_path << '\n';
+                break;
+            }
+            succeeded = present_bgra8(window, pixels, width, height);
 #if defined(_WIN32)
-        if (succeeded)
-            Sleep(16);
+            if (succeeded)
+                Sleep(16);
 #endif
+        }
+        while (succeeded && pump_example_window(window));
     }
-    while (succeeded && pump_example_window(window));
 
     close_example_window(window);
-    device.gpu_free(sampler_heap);
-    device.gpu_free(resource_heap);
-    device.gpu_free(readback);
-    device.gpu_free(vertex_memory);
+    gfx::destroy_pipeline(pipeline);
+    gfx::gpu_free(device, readback);
+    gfx::destroy_texture(depth);
+    gfx::destroy_texture(target);
+    gfx::destroy_texture(texture);
+    gfx::gpu_free(device, vertex_memory);
+    gfx::gpu_free(device, sampler_heap);
+    gfx::gpu_free(device, resource_heap);
+    gfx::destroy_device(device);
     return succeeded ? 0 : 1;
 }

@@ -22,5 +22,6 @@ struct CubeRootArguments
     CubeVertex* vertices;
     uint32 texture_index;
     uint32 padding;
-    float4x4 mvp;
+    float3x4 transform;
+    float2 depth_transform;
 };

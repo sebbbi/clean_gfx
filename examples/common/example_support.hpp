@@ -19,23 +19,18 @@ inline constexpr bool example_window_supported = false;
 #endif
 
 const char* gfx_error_name(gfx::Error error) noexcept;
-bool gfx_succeeded(gfx::Error error,
-                   const char* application,
-                   const char* operation) noexcept;
 
-bool read_spirv(const char* application,
-                const char* path,
-                std::vector<std::uint32_t>& words) noexcept;
+std::vector<std::uint32_t> read_spirv(const char* application,
+                                      const char* path) noexcept;
 bool write_bgra8_ppm(const char* application,
                      const char* path,
                      const std::byte* bgra,
                      std::uint32_t width,
                      std::uint32_t height) noexcept;
 
-bool open_example_window(ExampleWindow& window,
-                         const char* title,
-                         std::uint32_t width,
-                         std::uint32_t height) noexcept;
+ExampleWindow open_example_window(const char* title,
+                                  std::uint32_t width,
+                                  std::uint32_t height) noexcept;
 bool pump_example_window(ExampleWindow& window) noexcept;
 bool present_bgra8(ExampleWindow& window,
                    const std::byte* pixels,

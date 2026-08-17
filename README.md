@@ -15,25 +15,33 @@ The implementation deliberately creates no `VkDescriptorSetLayout`, `VkDescripto
 - Slang pointers for custom vertex fetch and arbitrary BDA-backed structures;
 - Vulkan 1.4 dynamic rendering and synchronization2 for the remaining fixed-function work.
 
-There is no public buffer object or owning memory class. `Device::gpu_malloc()` returns the plain
-`GpuAllocation {cpu_ptr, gpu_ptr, size}` POD. Its default `MemoryType::default_` is strictly
+There is no public buffer object or owning memory class. `gpu_malloc<T>()` returns the plain
+`GpuAllocation<T> {cpu, gpu, size}` POD. Its default `MemoryType::default_` is strictly
 device-local, host-visible, and host-coherent, so ordinary GPU allocations expose both a
 persistently mapped CPU pointer and their GPU pointer. `MemoryType::readback` uses the same required
 memory properties and additionally prefers host-cached memory. `MemoryType::gpu_only` is
-non-host-visible, so its `cpu_ptr` is null. `gpu_free()` takes the unchanged allocation POD.
-Address-based command APIs take
-the separate `GpuRange {gpu_ptr, size}` POD, allowing a caller to bind all or part of an allocation
+non-host-visible, so its `cpu` pointer is null. `gpu_free()` takes the unchanged allocation POD.
+Address-based command APIs take the separate `GpuRange {gpu, size}` POD, and `gpu_range()` converts
+an allocation to its full range. This lets a caller bind all or part of an allocation
 without exposing a Vulkan buffer handle. `gpu_malloc_resource_heap()` and
 `gpu_malloc_sampler_heap()` create coherent, directly writable descriptor heaps. The application
 chooses 32-bit resource/sampler slot indices, writes descriptors through the returned CPU pointer,
 and explicitly binds the corresponding GPU range on command lists that use them.
 
-The library is built without C++ exception handling. Programming errors are assertions. Operations
-that can fail for runtime reasons return `Error`; object factories take an output object first and
-leave it empty on failure. CPU allocation failure is deliberately not handled. GPU heap exhaustion
-is the one allocation-specific case: `gpu_malloc()`, `gpu_malloc_resource_heap()`, and
+The public API is a set of free functions in namespace `gfx`. Devices, textures, pipelines, and
+command lists are opaque raw pointer handles rather than C++ ownership wrappers. After device
+initialization, creation returns a handle directly and matching `destroy_*()` functions release it;
+applications destroy owned handles explicitly in reverse creation order. A submitted command list
+is consumed by `submit()` or `submit_and_wait()`; `destroy_command_list()` abandons one that was not
+submitted.
+
+The library is built without C++ exception handling. Programming errors and Vulkan failures after
+device creation assert and abort. `create_device()` is the one recoverable object-creation operation:
+it returns `DeviceInit {device, error}` because no device exists yet on which to report a fatal
+runtime failure. CPU allocation failure is deliberately not handled. GPU heap exhaustion is the one
+allocation-specific case: `gpu_malloc()`, `gpu_malloc_resource_heap()`, and
 `gpu_malloc_sampler_heap()` return the canonical null `GpuAllocation {nullptr, nullptr, 0}`. Test
-`gpu_ptr` if an application wants to recover; the examples deliberately assume their tiny
+`gpu` if an application wants to recover; the examples deliberately assume their tiny
 allocations succeed and perform no such checks.
 
 ## Requirements
@@ -109,9 +117,9 @@ struct RootArguments
 ```
 
 The root is an ordinary CPU POD. Its pointer fields carry GPU addresses and must not be dereferenced
-by the CPU. `shader_types.h` supplies C-layout-compatible POD equivalents for Slang vector and
-matrix types. Shared structures use `-fvk-use-c-layout`, plus `-matrix-layout-row-major` when they
-contain matrices. Matrix names use Slang's row-count-by-column-count convention; for example, C++
+by the CPU. `shader_types.h` supplies C-layout-compatible POD equivalents for Slang vector types
+and `float3x4`. Shared structures use `-fvk-use-c-layout`, plus `-matrix-layout-row-major` when they
+contain the matrix. Slang names matrix dimensions as row count by column count, so the C++
 `float3x4` stores three `float4` rows. The draw/dispatch template copies the complete root through
 `vkCmdPushDataEXT` while the command is recorded, so the CPU root need not outlive the call.
 
@@ -119,14 +127,15 @@ The first argument is `nullptr` when a draw or dispatch has no root. No push-dat
 in that case:
 
 ```cpp
-commands.draw(nullptr, 3);
+gfx::draw(commands, nullptr, 3);
 
-RootArguments root{static_cast<Vertex*>(vertices.gpu_ptr)};
-commands.draw(&root, vertex_count);
+RootArguments root{vertices.gpu};
+gfx::draw(commands, &root, vertex_count);
 ```
 
 The triangle is deliberately rootless. The cube uses a root containing a vertex pointer, texture
-index, and shared `float4x4` transform. Sampler slots use one enum shared by C++ and Slang:
+index, a shared `float3x4` clip transform, and two depth coefficients. Sampler slots use one enum
+shared by C++ and Slang:
 
 ```slang
 Texture2D<float4> texture = ResourceDescriptorHeap[root.texture_index];
@@ -156,7 +165,7 @@ dedicated allocation from the same coherent mapped device-local memory used by d
 The buffer covers the aligned user bytes, suffix padding, and Vulkan-required implementation
 reservation; no 256 MiB descriptor page is created. The public `GpuAllocation` exposes only the
 requested user range. Slot zero is therefore exactly
-`cpu_ptr`/`gpu_ptr`; slot `i` is `i * DeviceCaps::image_descriptor_size` bytes into a resource heap
+`cpu`/`gpu`; slot `i` is `i * DeviceCaps::image_descriptor_size` bytes into a resource heap
 or `i * DeviceCaps::sampler_descriptor_size` bytes into a sampler heap.
 
 Textures are normally suballocated from separate 256 MiB GPU-only image-memory heaps; only images
@@ -168,7 +177,7 @@ descriptors are generated directly from image create information; a real `VkImag
 only when fixed-function attachment use requires one.
 
 Two persistent frame contexts own reusable command pools, command buffers, and timeline values.
-`Device::submit()` queues work and returns without waiting; `submit_and_wait()` is the synchronous
+`submit()` queues work and returns without waiting; `submit_and_wait()` is the synchronous
 convenience path. Both `submit_and_wait()` and `wait_idle()` reset completed command pools after
 waiting, releasing descriptor-heap reserved ranges as well as retiring execution. The backend
 retains no allocations, textures, pipelines, descriptor slots, or other user resources for a
@@ -187,11 +196,11 @@ populating them requires extending the copy API. The unified-layout extension de
 remove the one-time initialization out of `VK_IMAGE_LAYOUT_UNDEFINED`; clean_gfx records it lazily
 in the next command-list's batched texture-initialization dependency.
 
-Address-based command methods consume `GpuRange` PODs directly. Command recording performs no
+Address-based command functions consume `GpuRange` PODs directly. Command recording performs no
 hidden allocation lookup or command-list lifetime retention. GPU pointers copied from root data and
 descriptor-heap contents are opaque to the backend, so all pointed-to allocations, textures,
 pipelines, heaps, and descriptor slots remain the caller's lifetime responsibility through GPU completion. Callers
-synchronize genuine read/write hazards with `CommandList::barrier()`; no image-layout state is
+synchronize genuine read/write hazards with `barrier()`; no image-layout state is
 exposed by the public API.
 
 See [Vulkan support and cross-reference](docs/vulkan-support.md) and
