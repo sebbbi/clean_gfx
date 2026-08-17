@@ -1,44 +1,12 @@
-find_program(CLEAN_GFX_SLANGC NAMES slangc REQUIRED)
-find_program(CLEAN_GFX_SPIRV_VAL NAMES spirv-val)
+include(${CMAKE_CURRENT_LIST_DIR}/../clean_gfx_slang.cmake)
+clean_gfx_find_shader_tools()
 
 set(CLEAN_GFX_CUBE_SHADER_SOURCE ${CMAKE_CURRENT_SOURCE_DIR}/cube.slang)
 set(CLEAN_GFX_CUBE_SHADER_OUTPUT_DIR ${CMAKE_CURRENT_BINARY_DIR}/shaders)
 set(CLEAN_GFX_CUBE_VERTEX_SPV ${CLEAN_GFX_CUBE_SHADER_OUTPUT_DIR}/cube.vert.spv)
 set(CLEAN_GFX_CUBE_FRAGMENT_SPV ${CLEAN_GFX_CUBE_SHADER_OUTPUT_DIR}/cube.frag.spv)
 
-execute_process(
-    COMMAND ${CLEAN_GFX_SLANGC} -h
-    OUTPUT_VARIABLE CLEAN_GFX_CUBE_SLANG_HELP
-    ERROR_VARIABLE CLEAN_GFX_CUBE_SLANG_HELP_ERROR
-)
-string(APPEND CLEAN_GFX_CUBE_SLANG_HELP "${CLEAN_GFX_CUBE_SLANG_HELP_ERROR}")
-
-set(CLEAN_GFX_CUBE_DESCRIPTOR_ARGUMENTS)
-set(CLEAN_GFX_CUBE_NATIVE_DESCRIPTOR_HEAP OFF)
-if(CLEAN_GFX_CUBE_SLANG_HELP MATCHES "spvDescriptorHeapEXT")
-    set(CLEAN_GFX_CUBE_NATIVE_DESCRIPTOR_HEAP ON)
-    list(APPEND CLEAN_GFX_CUBE_DESCRIPTOR_ARGUMENTS
-        -capability spvDescriptorHeapEXT
-        -DCLEAN_GFX_NATIVE_DESCRIPTOR_HEAP=1)
-else()
-    list(APPEND CLEAN_GFX_CUBE_DESCRIPTOR_ARGUMENTS
-        -DCLEAN_GFX_DESCRIPTOR_MAPPING_FALLBACK=1)
-endif()
-
-set(CLEAN_GFX_CUBE_LAYOUT_ARGUMENT -fvk-use-c-layout)
-if(NOT CLEAN_GFX_CUBE_SLANG_HELP MATCHES "fvk-use-c-layout")
-    set(CLEAN_GFX_CUBE_LAYOUT_ARGUMENT -fvk-use-scalar-layout)
-    message(WARNING
-        "slangc does not advertise -fvk-use-c-layout; the cube example is using "
-        "the scalar-layout compatibility path")
-endif()
-
 function(clean_gfx_compile_cube_slang output entry stage)
-    set(validate_command)
-    if(CLEAN_GFX_SPIRV_VAL AND NOT CLEAN_GFX_CUBE_NATIVE_DESCRIPTOR_HEAP)
-        set(validate_command COMMAND ${CLEAN_GFX_SPIRV_VAL}
-            --target-env vulkan1.4 --scalar-block-layout ${output})
-    endif()
     add_custom_command(
         OUTPUT ${output}
         COMMAND ${CMAKE_COMMAND} -E make_directory ${CLEAN_GFX_CUBE_SHADER_OUTPUT_DIR}
@@ -48,14 +16,16 @@ function(clean_gfx_compile_cube_slang output entry stage)
             -profile spirv_1_6
             -emit-spirv-directly
             -fvk-use-entrypoint-name
-            ${CLEAN_GFX_CUBE_LAYOUT_ARGUMENT}
-            ${CLEAN_GFX_CUBE_DESCRIPTOR_ARGUMENTS}
+            -fvk-use-c-layout
+            -matrix-layout-row-major
+            -capability spvDescriptorHeapEXT
             -I ${CMAKE_CURRENT_SOURCE_DIR}
             -I ${PROJECT_SOURCE_DIR}/include
             -entry ${entry}
             -stage ${stage}
             -o ${output}
-        ${validate_command}
+        COMMAND ${CLEAN_GFX_SPIRV_VAL}
+            --target-env vulkan1.4 --scalar-block-layout ${output}
         DEPENDS
             ${CLEAN_GFX_CUBE_SHADER_SOURCE}
             ${CMAKE_CURRENT_SOURCE_DIR}/cube_shared.h
@@ -70,10 +40,27 @@ clean_gfx_compile_cube_slang(${CLEAN_GFX_CUBE_FRAGMENT_SPV} fragmentMain fragmen
 
 add_executable(clean_gfx_cube
     cube.cpp
+    cube_shared.h
+    ${CLEAN_GFX_CUBE_SHADER_SOURCE}
+    lunarg_logo_png.hpp
+    NOTICE.md
+    LICENSE-Apache-2.0.txt
     ../common/example_support.cpp
+    ../common/example_support.hpp
     ${CLEAN_GFX_CUBE_VERTEX_SPV}
     ${CLEAN_GFX_CUBE_FRAGMENT_SPV}
 )
+set_source_files_properties(${CLEAN_GFX_CUBE_SHADER_SOURCE}
+    PROPERTIES HEADER_FILE_ONLY TRUE)
+source_group("Shaders" FILES ${CLEAN_GFX_CUBE_SHADER_SOURCE})
+source_group("Shared" FILES cube_shared.h)
+source_group("Assets" FILES
+    lunarg_logo_png.hpp
+    NOTICE.md
+    LICENSE-Apache-2.0.txt)
+source_group("Common" FILES
+    ../common/example_support.cpp
+    ../common/example_support.hpp)
 clean_gfx_disable_exceptions(clean_gfx_cube)
 target_link_libraries(clean_gfx_cube PRIVATE clean_gfx::clean_gfx)
 target_include_directories(clean_gfx_cube PRIVATE

@@ -1,12 +1,8 @@
-#include "triangle_shared.h"
-
 #include "example_support.hpp"
 
-#include <array>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
-#include <cstring>
 #include <iostream>
 #include <thread>
 #include <utility>
@@ -29,14 +25,6 @@ int main(int argc, char** argv)
             "create device"))
         return 1;
     std::cout << "Using " << device.caps().device_name << '\n';
-
-    const std::array vertices{
-        Vertex{{0.5f, -0.5f, 0.5f}, {1.0f, 0.0f, 0.0f}},
-        Vertex{{0.5f, 0.5f, 0.5f}, {0.0f, 1.0f, 0.0f}},
-        Vertex{{-0.5f, 0.5f, 0.5f}, {0.0f, 0.0f, 1.0f}},
-    };
-    auto vertex_memory = device.gpu_malloc<Vertex>(vertices.size());
-    std::memcpy(vertex_memory.cpu_ptr, vertices.data(), sizeof(vertices));
 
     gfx::Texture target;
     if (!gfx_succeeded(
@@ -81,17 +69,12 @@ int main(int argc, char** argv)
             "create graphics pipeline"))
         return 1;
 
-    const RootArguments root{
-        .vertices = static_cast<Vertex*>(vertex_memory.gpu_ptr),
-    };
-
     gfx::CommandList commands;
     if (!gfx_succeeded(device.begin_commands(commands), application, "begin commands"))
         return 1;
     commands.begin_rendering(target, {0.01f, 0.01f, 0.033f, 1.0f});
     commands.bind_pipeline(pipeline);
-    commands.push_root(root);
-    commands.draw(3);
+    commands.draw(nullptr, 3);
     commands.end_rendering();
     commands.barrier(gfx::Stage::color_output,
                      gfx::Access::color_write,
@@ -141,6 +124,5 @@ int main(int argc, char** argv)
     }
 
     device.gpu_free(readback_memory);
-    device.gpu_free(vertex_memory);
     return 0;
 }

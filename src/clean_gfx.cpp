@@ -5,15 +5,13 @@
 
 #include <algorithm>
 #include <array>
-#include <atomic>
 #include <bit>
 #include <cassert>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
-#include <map>
-#include <mutex>
+#include <new>
 #include <optional>
 #include <utility>
 #include <vector>
@@ -23,7 +21,6 @@ namespace gfx
 namespace
 {
 
-constexpr std::uint32_t invalid_heap_index = std::numeric_limits<std::uint32_t>::max();
 constexpr std::uint32_t allocation_heap_size = 256u * 1024u * 1024u;
 
 [[nodiscard]] Error error_from_vk(VkResult result) noexcept
@@ -81,6 +78,7 @@ bool has_name(std::span<const VkExtensionProperties> values, const char* name)
     });
 }
 
+#if !defined(NDEBUG)
 bool has_name(std::span<const VkLayerProperties> values, const char* name)
 {
     return std::ranges::any_of(values, [name](const VkLayerProperties& value) {
@@ -105,6 +103,7 @@ VKAPI_ATTR VkBool32 VKAPI_CALL debug_callback(
     }
     return VK_FALSE;
 }
+#endif
 
 VkFormat to_vk(Format format)
 {
@@ -176,8 +175,7 @@ VkFormatFeatureFlags2 required_format_features(TextureUsage usage)
 {
     VkFormatFeatureFlags2 result = 0;
     if (has_flag(usage, TextureUsage::sampled))
-        result |= VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_BIT |
-                  VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
+        result |= VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_BIT;
     if (has_flag(usage, TextureUsage::storage))
         result |= VK_FORMAT_FEATURE_2_STORAGE_IMAGE_BIT |
                   VK_FORMAT_FEATURE_2_STORAGE_READ_WITHOUT_FORMAT_BIT |
@@ -376,8 +374,8 @@ std::size_t memory_pool_index(MemoryType memory)
 {
     switch (memory)
     {
-    case MemoryType::upload: return 0;
-    case MemoryType::gpu: return 1;
+    case MemoryType::default_: return 0;
+    case MemoryType::gpu_only: return 1;
     case MemoryType::readback: return 2;
     default:
         assert(false && "invalid GPU memory type");
@@ -492,74 +490,31 @@ struct BackingBuffer
 
 struct AllocationHeap;
 struct AllocationRecord;
+struct DescriptorAllocation;
+struct ImageHeap;
 
-struct ResolvedGpuAddress
+enum class DescriptorHeapType : std::uint8_t
 {
-    std::shared_ptr<AllocationRecord> allocation;
-    VkDeviceAddress address = 0;
-    VkDeviceSize size = 0;
+    resource,
+    sampler,
 };
 
-struct DescriptorHeap
+struct TextureInitialization
 {
-    BackingBuffer backing;
-    VkDeviceSize bind_offset = 0;
-    VkDeviceSize bind_size = 0;
-    VkDeviceSize reserved_size = 0;
-    VkDeviceSize descriptor_size = 0;
-    std::uint32_t first_index = 0;
-    std::uint32_t capacity = 0;
-    std::uint32_t next_slot = 0;
-    std::vector<std::uint32_t> free_slots;
-    std::mutex mutex;
+    VkImage image = VK_NULL_HANDLE;
+    VkImageAspectFlags aspect_mask = 0;
+    std::uint32_t mip_levels = 0;
+    bool initialized = false;
+    std::vector<TextureInitialization*>* owner = nullptr;
+};
 
-    [[nodiscard]] std::uint32_t allocate() noexcept
-    {
-        const std::scoped_lock lock(mutex);
-        std::uint32_t slot = 0;
-        if (!free_slots.empty())
-        {
-            slot = free_slots.back();
-            free_slots.pop_back();
-        }
-        else
-        {
-            if (next_slot == capacity)
-                return invalid_heap_index;
-            slot = next_slot++;
-        }
-        assert(slot <= std::numeric_limits<std::uint32_t>::max() - first_index);
-        return first_index + slot;
-    }
-
-    void release(std::uint32_t index)
-    {
-        if (index == invalid_heap_index)
-            return;
-        const std::scoped_lock lock(mutex);
-        const bool valid = index >= first_index && index < first_index + capacity;
-        assert(valid && "descriptor index does not belong to this heap");
-        if (!valid)
-            return;
-        free_slots.push_back(index - first_index);
-    }
-
-    [[nodiscard]] void* host_address(std::uint32_t index) const
-    {
-        const auto offset = static_cast<VkDeviceSize>(index) * descriptor_size;
-        return static_cast<std::byte*>(backing.mapped) + bind_offset + offset;
-    }
-
-    [[nodiscard]] VkBindHeapInfoEXT bind_info() const
-    {
-        return {
-            .sType = VK_STRUCTURE_TYPE_BIND_HEAP_INFO_EXT,
-            .pNext = nullptr,
-            .heapRange = {backing.address + bind_offset, bind_size},
-            .reservedRangeOffset = 0,
-            .reservedRangeSize = reserved_size,
-        };
-    }
+struct FrameContext
+{
+    VkCommandPool command_pool = VK_NULL_HANDLE;
+    VkCommandBuffer command_buffer = VK_NULL_HANDLE;
+    void* command_list_storage = nullptr;
+    std::uint64_t last_signal = 0;
+    bool active = false;
 };
 
 struct DeviceState
@@ -578,14 +533,18 @@ struct DeviceState
     VkPhysicalDeviceDescriptorHeapPropertiesEXT heap_properties{
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_HEAP_PROPERTIES_EXT};
     DeviceFunctions fn;
-    DescriptorHeap resource_heap;
-    DescriptorHeap sampler_heap;
     DeviceCaps caps;
-    mutable std::atomic_uint32_t live_memory_allocations{0};
-    mutable std::mutex queue_mutex;
-    mutable std::mutex allocation_mutex;
-    std::array<std::vector<std::shared_ptr<AllocationHeap>>, 3> allocation_heaps;
-    std::map<VkDeviceAddress, std::shared_ptr<AllocationRecord>> allocations;
+    mutable std::uint32_t live_memory_allocations = 0;
+    std::array<std::vector<std::unique_ptr<AllocationHeap>>, 3> allocation_heaps;
+    std::vector<AllocationRecord> allocations;
+    std::vector<std::unique_ptr<DescriptorAllocation>> descriptor_allocations;
+    std::vector<std::unique_ptr<ImageHeap>> image_heaps;
+    std::vector<TextureInitialization*> pending_texture_initializations;
+    std::array<FrameContext, 2> frames;
+    VkSemaphore timeline = VK_NULL_HANDLE;
+    std::uint64_t next_frame = 0;
+    std::uint64_t next_signal = 1;
+    std::uint64_t last_submitted_signal = 0;
 
     ~DeviceState();
 
@@ -621,22 +580,14 @@ struct DeviceState
             return Error::out_of_device_memory;
 
         const auto maximum = physical_properties.limits.maxMemoryAllocationCount;
-        auto count = live_memory_allocations.load(std::memory_order_relaxed);
-        for (;;)
-        {
-            if (count >= maximum)
-                return Error::out_of_device_memory;
-            if (live_memory_allocations.compare_exchange_weak(
-                    count, count + 1, std::memory_order_acq_rel, std::memory_order_relaxed))
-            {
-                break;
-            }
-        }
+        if (live_memory_allocations >= maximum)
+            return Error::out_of_device_memory;
+        ++live_memory_allocations;
 
         const auto result = vkAllocateMemory(device, &info, nullptr, &output);
         if (result != VK_SUCCESS)
         {
-            live_memory_allocations.fetch_sub(1, std::memory_order_acq_rel);
+            --live_memory_allocations;
             output = VK_NULL_HANDLE;
             return error_from_vk(result);
         }
@@ -648,17 +599,20 @@ struct DeviceState
         if (!memory)
             return;
         vkFreeMemory(device, memory, nullptr);
-        live_memory_allocations.fetch_sub(1, std::memory_order_acq_rel);
+        assert(live_memory_allocations != 0);
+        --live_memory_allocations;
     }
 
     [[nodiscard]] bool find_memory_type(std::uint32_t bits,
                                         VkMemoryPropertyFlags required,
                                         VkMemoryPropertyFlags preferred,
+                                        VkDeviceSize minimum_heap_size,
                                         std::uint32_t& output,
                                         VkMemoryPropertyFlags forbidden = 0) const noexcept
     {
         std::optional<std::uint32_t> best;
         std::uint32_t best_score = 0;
+        VkDeviceSize best_heap_size = 0;
         for (std::uint32_t i = 0; i < memory_properties.memoryTypeCount; ++i)
         {
             if ((bits & (1u << i)) == 0)
@@ -668,11 +622,21 @@ struct DeviceState
                 continue;
             if (!is_usable_memory_type(memory_properties, i))
                 continue;
+            const auto& heap = memory_properties.memoryHeaps[
+                memory_properties.memoryTypes[i].heapIndex];
+            if (heap.size < minimum_heap_size ||
+                ((required & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0 &&
+                 (heap.flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) == 0))
+            {
+                continue;
+            }
             const auto score = static_cast<std::uint32_t>(std::popcount(flags & preferred));
-            if (!best || score > best_score)
+            if (!best || score > best_score ||
+                (score == best_score && heap.size > best_heap_size))
             {
                 best = i;
                 best_score = score;
+                best_heap_size = heap.size;
             }
         }
         if (!best)
@@ -714,7 +678,8 @@ struct DeviceState
         result.allocation_size = requirements.size;
         std::uint32_t memory_type = 0;
         if (!find_memory_type(
-                requirements.memoryTypeBits, required, preferred, memory_type, forbidden))
+                requirements.memoryTypeBits, required, preferred,
+                requirements.size, memory_type, forbidden))
         {
             destroy_backing(result);
             return Error::unsupported;
@@ -778,91 +743,50 @@ struct DeviceState
     }
 
     [[nodiscard]] GpuAllocation allocate_gpu(
-        const std::shared_ptr<DeviceState>& owner,
         VkDeviceSize size,
         MemoryType memory,
         VkDeviceSize alignment) noexcept;
-    [[nodiscard]] ResolvedGpuAddress resolve_gpu_address(
-        GpuRange range) const noexcept;
+    [[nodiscard]] GpuAllocation allocate_descriptor_heap(
+        VkDeviceSize size,
+        DescriptorHeapType type) noexcept;
     void release_allocation(GpuAllocation allocation) noexcept;
-    void free_suballocation(AllocationRecord& allocation) noexcept;
+    [[nodiscard]] Error create_frame_commands(FrameContext& frame) noexcept;
+    void destroy_frame_commands(FrameContext& frame) noexcept;
+    [[nodiscard]] Error reset_frame_commands(FrameContext& frame) noexcept;
 
-    [[nodiscard]] Error initialize_heap(DescriptorHeap& heap,
-                                        std::uint32_t capacity,
-                                        VkDeviceSize descriptor_size,
-                                        VkDeviceSize descriptor_alignment,
-                                        VkDeviceSize heap_alignment,
-                                        VkDeviceSize reserved_size,
-                                        VkDeviceSize maximum_size) noexcept
+};
+
+struct ImageHeap
+{
+    ImageHeap(DeviceState* owner, std::uint32_t type)
+        : state(owner), memory_type(type), offsets(allocation_heap_size)
+    {}
+
+    ~ImageHeap()
     {
-        assert(capacity != 0);
-        if (capacity == 0)
-            return Error::unsupported;
-        if (descriptor_size == 0)
-            return Error::driver_error;
-        if (descriptor_size % std::max<VkDeviceSize>(descriptor_alignment, 1) != 0)
-            return Error::driver_error;
-
-        const auto offset_alignment = descriptor_size;
-        if (reserved_size > std::numeric_limits<VkDeviceSize>::max() -
-                                (offset_alignment - 1))
-            return Error::unsupported;
-        const auto user_offset = align_up(reserved_size, offset_alignment);
-        if (user_offset > maximum_size ||
-            static_cast<VkDeviceSize>(capacity) > (maximum_size - user_offset) / descriptor_size)
-            return Error::unsupported;
-        const auto desired_size =
-            user_offset + static_cast<VkDeviceSize>(capacity) * descriptor_size;
-
-        const auto address_alignment = std::max<VkDeviceSize>(heap_alignment, 1);
-        if (desired_size > std::numeric_limits<VkDeviceSize>::max() - (address_alignment - 1))
-            return Error::unsupported;
-        BackingBuffer backing;
-        const auto error = create_backing_buffer(
-            backing,
-            desired_size + address_alignment - 1,
-            VK_BUFFER_USAGE_DESCRIPTOR_HEAP_BIT_EXT |
-                VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
-                VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
-                VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-            cpu_visible_memory_properties,
-            0);
-        if (error != Error::none)
-            return error;
-        heap.backing = backing;
-        const auto aligned_address = align_up(heap.backing.address, address_alignment);
-        heap.bind_offset = aligned_address - heap.backing.address;
-        heap.bind_size = desired_size;
-        heap.reserved_size = reserved_size;
-        heap.descriptor_size = descriptor_size;
-        const auto first_index = user_offset / descriptor_size;
-        if (first_index > std::numeric_limits<std::uint32_t>::max())
-            return Error::unsupported;
-        heap.first_index = static_cast<std::uint32_t>(first_index);
-        heap.capacity = capacity;
-        heap.next_slot = 0;
-
-        assert(heap.bind_offset <= heap.backing.size &&
-               heap.bind_size <= heap.backing.size - heap.bind_offset);
-        if (heap.first_index > std::numeric_limits<std::uint32_t>::max() - capacity)
-            return Error::unsupported;
-        return Error::none;
+        if (state && memory)
+            state->free_memory(memory);
     }
+
+    DeviceState* state = nullptr;
+    std::uint32_t memory_type = 0;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    OffsetAllocator::Allocator offsets;
 };
 
 struct AllocationHeap
 {
-    AllocationHeap(const std::shared_ptr<DeviceState>& owner, MemoryType type)
+    AllocationHeap(DeviceState* owner, MemoryType type)
         : state(owner), memory(type), offsets(allocation_heap_size)
     {}
 
     ~AllocationHeap()
     {
-        if (const auto owner = state.lock())
-            owner->destroy_backing(backing);
+        if (state)
+            state->destroy_backing(backing);
     }
 
-    std::weak_ptr<DeviceState> state;
+    DeviceState* state = nullptr;
     MemoryType memory;
     BackingBuffer backing;
     OffsetAllocator::Allocator offsets;
@@ -870,35 +794,46 @@ struct AllocationHeap
 
 struct AllocationRecord
 {
-    std::weak_ptr<DeviceState> state;
-    std::shared_ptr<AllocationHeap> heap;
+    AllocationHeap* heap = nullptr;
     OffsetAllocator::Allocation offset_allocation{};
     GpuAllocation value{};
-    bool owns_suballocation = false;
+};
 
-    ~AllocationRecord()
+struct DescriptorAllocation
+{
+    explicit DescriptorAllocation(DeviceState* owner) : state(owner) {}
+
+    ~DescriptorAllocation()
     {
-        if (owns_suballocation)
-        {
-            if (const auto owner = state.lock())
-                owner->free_suballocation(*this);
-        }
+        if (state)
+            state->destroy_backing(backing);
     }
+
+    DeviceState* state = nullptr;
+    BackingBuffer backing;
+    GpuAllocation value{};
 };
 
 DeviceState::~DeviceState()
 {
     if (device)
         vkDeviceWaitIdle(device);
+    for (auto& frame : frames)
+    {
+        assert(!frame.active && "device destroyed while a command list is active");
+        destroy_frame_commands(frame);
+        if (frame.command_list_storage)
+            ::operator delete(frame.command_list_storage);
+        frame = {};
+    }
     allocations.clear();
     for (auto& pool : allocation_heaps)
-    {
-        for (auto& heap : pool)
-            destroy_backing(heap->backing);
         pool.clear();
-    }
-    destroy_backing(resource_heap.backing);
-    destroy_backing(sampler_heap.backing);
+    descriptor_allocations.clear();
+    image_heaps.clear();
+    if (device && timeline)
+        vkDestroySemaphore(device, timeline, nullptr);
+    timeline = VK_NULL_HANDLE;
     if (device)
         vkDestroyDevice(device, nullptr);
     if (instance && debug_messenger && destroy_debug_messenger)
@@ -907,37 +842,90 @@ DeviceState::~DeviceState()
         vkDestroyInstance(instance, nullptr);
 }
 
-GpuAllocation DeviceState::allocate_gpu(const std::shared_ptr<DeviceState>& owner,
-                                         VkDeviceSize size,
+Error DeviceState::create_frame_commands(FrameContext& frame) noexcept
+{
+    assert(!frame.command_pool && !frame.command_buffer);
+    const VkCommandPoolCreateInfo pool_info{
+        .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+        .pNext = nullptr,
+        .flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT,
+        .queueFamilyIndex = queue_family,
+    };
+    VkCommandPool command_pool = VK_NULL_HANDLE;
+    auto error = error_from_vk(
+        vkCreateCommandPool(device, &pool_info, nullptr, &command_pool));
+    if (error != Error::none)
+        return error;
+    frame.command_pool = command_pool;
+
+    const VkCommandBufferAllocateInfo allocate_info{
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+        .pNext = nullptr,
+        .commandPool = frame.command_pool,
+        .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+        .commandBufferCount = 1,
+    };
+    VkCommandBuffer command_buffer = VK_NULL_HANDLE;
+    error = error_from_vk(
+        vkAllocateCommandBuffers(device, &allocate_info, &command_buffer));
+    if (error != Error::none)
+        destroy_frame_commands(frame);
+    else
+        frame.command_buffer = command_buffer;
+    return error;
+}
+
+void DeviceState::destroy_frame_commands(FrameContext& frame) noexcept
+{
+    if (device && frame.command_pool)
+        vkDestroyCommandPool(device, frame.command_pool, nullptr);
+    frame.command_pool = VK_NULL_HANDLE;
+    frame.command_buffer = VK_NULL_HANDLE;
+}
+
+Error DeviceState::reset_frame_commands(FrameContext& frame) noexcept
+{
+    if (!frame.command_pool)
+    {
+        assert(!frame.command_buffer);
+        return Error::none;
+    }
+    assert(frame.command_buffer);
+    const auto error = error_from_vk(vkResetCommandPool(device, frame.command_pool, 0));
+    if (error != Error::none)
+        destroy_frame_commands(frame);
+    return error;
+}
+
+GpuAllocation DeviceState::allocate_gpu(VkDeviceSize size,
                                          MemoryType memory,
                                          VkDeviceSize alignment) noexcept
 {
-    assert(owner.get() == this);
     assert(size != 0 && "gpu_malloc byte count must be non-zero");
     assert(alignment != 0 && (alignment & (alignment - 1)) == 0 &&
            "gpu_malloc alignment must be a non-zero power of two");
+    if (size == 0 || alignment == 0 || (alignment & (alignment - 1)) != 0)
+        return {};
+
     const bool request_fits = size <= allocation_heap_size && alignment != 0 &&
-                              alignment - 1 <= allocation_heap_size - size;
+                               alignment - 1 <= allocation_heap_size - size;
     assert(request_fits && "gpu_malloc request including alignment padding exceeds 256 MiB");
-    if (!owner || size == 0 || alignment == 0 ||
-        (alignment & (alignment - 1)) != 0 || !request_fits)
+    if (!request_fits)
         return {};
 
     const auto padded_size = static_cast<std::uint32_t>(size + alignment - 1);
     const auto pool_index = memory_pool_index(memory);
-    const std::scoped_lock lock(allocation_mutex);
-
-    const auto make_heap = [&]() -> std::shared_ptr<AllocationHeap> {
-        auto heap = std::make_shared<AllocationHeap>(owner, memory);
+    const auto make_heap = [&]() -> std::unique_ptr<AllocationHeap> {
+        auto heap = std::make_unique<AllocationHeap>(this, memory);
         VkMemoryPropertyFlags required = 0;
         VkMemoryPropertyFlags preferred = 0;
         VkMemoryPropertyFlags forbidden = 0;
         switch (memory)
         {
-        case MemoryType::upload:
+        case MemoryType::default_:
             required = cpu_visible_memory_properties;
             break;
-        case MemoryType::gpu:
+        case MemoryType::gpu_only:
             required = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
             forbidden = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
             break;
@@ -951,130 +939,160 @@ GpuAllocation DeviceState::allocate_gpu(const std::shared_ptr<DeviceState>& owne
         }
         if (create_backing_buffer(
                 heap->backing,
-            allocation_heap_size,
-            universal_buffer_usage(),
-            required,
-            preferred,
+                allocation_heap_size,
+                universal_buffer_usage(),
+                required,
+                preferred,
                 forbidden) != Error::none)
             return {};
         return heap;
     };
 
-    const auto try_allocate = [&](const std::shared_ptr<AllocationHeap>& heap)
-        -> std::shared_ptr<AllocationRecord> {
-        if (heap->backing.mapped)
+    const auto try_allocate = [&](AllocationHeap& heap, GpuAllocation& output) {
+        if (heap.backing.mapped)
         {
-            const auto host_base = reinterpret_cast<std::uintptr_t>(heap->backing.mapped);
-            if ((host_base % alignment) != (heap->backing.address % alignment))
-                return {};
+            const auto host_base = reinterpret_cast<std::uintptr_t>(heap.backing.mapped);
+            if ((host_base % alignment) != (heap.backing.address % alignment))
+                return false;
         }
 
-        const auto token = heap->offsets.allocate(padded_size);
+        const auto token = heap.offsets.allocate(padded_size);
         if (token.offset == OffsetAllocator::Allocation::NO_SPACE)
-            return {};
+            return false;
 
-        const auto raw_address = heap->backing.address + token.offset;
+        const auto raw_address = heap.backing.address + token.offset;
         const auto gpu_address = align_up(raw_address, alignment);
-        const auto offset = gpu_address - heap->backing.address;
+        const auto offset = gpu_address - heap.backing.address;
         const bool valid_range = offset <= allocation_heap_size &&
                                  size <= allocation_heap_size - offset;
         assert(valid_range && "OffsetAllocator returned an invalid padded range");
         if (!valid_range)
         {
-            heap->offsets.free(token);
-            return {};
+            heap.offsets.free(token);
+            return false;
         }
 
         void* cpu_pointer = nullptr;
-        if (heap->backing.mapped)
+        if (heap.backing.mapped)
         {
             const auto host_address =
-                reinterpret_cast<std::uintptr_t>(heap->backing.mapped) + offset;
+                reinterpret_cast<std::uintptr_t>(heap.backing.mapped) + offset;
             assert(host_address % alignment == 0 &&
                    "mapped GPU allocation does not satisfy its requested alignment");
             if (host_address % alignment != 0)
             {
-                heap->offsets.free(token);
-                return {};
+                heap.offsets.free(token);
+                return false;
             }
             cpu_pointer = reinterpret_cast<void*>(host_address);
         }
         assert(gpu_address % alignment == 0 &&
                "GPU allocation does not satisfy its requested alignment");
 
-        auto record = std::make_shared<AllocationRecord>();
-        record->state = owner;
-        record->heap = heap;
-        record->offset_allocation = token;
-        record->value = {
+        AllocationRecord record{
+            .heap = &heap,
+            .offset_allocation = token,
+            .value = {
             .cpu_ptr = cpu_pointer,
             .gpu_ptr = reinterpret_cast<void*>(
                 static_cast<std::uintptr_t>(gpu_address)),
             .size = size,
+            },
         };
 
-        const auto [entry, inserted] = allocations.emplace(gpu_address, record);
-        (void)entry;
-        assert(inserted && "duplicate live GPU allocation address");
-        if (!inserted)
-        {
-            heap->offsets.free(token);
-            return {};
-        }
-        record->owns_suballocation = true;
-        return record;
+        output = record.value;
+        allocations.push_back(record);
+        return true;
     };
 
     auto& pool = allocation_heaps[pool_index];
     for (const auto& heap : pool)
     {
-        if (auto allocation = try_allocate(heap))
-            return allocation->value;
+        GpuAllocation allocation{};
+        if (try_allocate(*heap, allocation))
+            return allocation;
     }
 
     auto heap = make_heap();
     if (!heap)
         return {};
-    pool.push_back(heap);
-    if (auto allocation = try_allocate(heap))
-        return allocation->value;
+    auto* heap_pointer = heap.get();
+    pool.push_back(std::move(heap));
+    GpuAllocation allocation{};
+    if (try_allocate(*heap_pointer, allocation))
+        return allocation;
     pool.pop_back();
     return {};
 }
 
-ResolvedGpuAddress DeviceState::resolve_gpu_address(GpuRange range) const noexcept
+GpuAllocation DeviceState::allocate_descriptor_heap(
+    VkDeviceSize size,
+    DescriptorHeapType type) noexcept
 {
-    const bool nonempty = range.gpu_ptr && range.size != 0;
-    assert(nonempty && "GPU range must have a non-null pointer and non-zero size");
-    if (!nonempty)
-        return {};
-    const auto address = static_cast<VkDeviceAddress>(
-        reinterpret_cast<std::uintptr_t>(range.gpu_ptr));
-    const bool address_fits =
-        address <= std::numeric_limits<VkDeviceAddress>::max() - range.size;
-    assert(address_fits && "GPU range address overflow");
-    if (!address_fits)
+    assert(size != 0 && "descriptor heap byte count must be non-zero");
+    if (size == 0)
         return {};
 
-    const std::scoped_lock lock(allocation_mutex);
-    auto next = allocations.upper_bound(address);
-    const bool found = next != allocations.begin();
-    assert(found && "GPU range does not belong to a live gpu_malloc allocation");
-    if (!found)
+    const bool resource = type == DescriptorHeapType::resource;
+    const auto reserved_alignment = resource
+        ? std::max(heap_properties.imageDescriptorAlignment,
+                   heap_properties.bufferDescriptorAlignment)
+        : heap_properties.samplerDescriptorAlignment;
+    const auto heap_alignment = resource
+        ? heap_properties.resourceHeapAlignment
+        : heap_properties.samplerHeapAlignment;
+    const auto reserved_size = resource
+        ? heap_properties.minResourceHeapReservedRange
+        : heap_properties.minSamplerHeapReservedRange;
+    const auto maximum_size = resource
+        ? heap_properties.maxResourceHeapSize
+        : heap_properties.maxSamplerHeapSize;
+
+    const bool valid_properties =
+        reserved_alignment != 0 &&
+        (reserved_alignment & (reserved_alignment - 1)) == 0 &&
+        heap_alignment != 0 && (heap_alignment & (heap_alignment - 1)) == 0;
+    assert(valid_properties && "descriptor heap alignment properties are invalid");
+    if (!valid_properties || size > maximum_size ||
+        size > std::numeric_limits<VkDeviceSize>::max() -
+                   (reserved_alignment - 1))
+    {
         return {};
-    const auto allocation_entry = std::prev(next);
-    const auto& allocation = allocation_entry->second;
-    const auto offset = address - allocation_entry->first;
-    const bool range_fits = offset < allocation->value.size &&
-                            range.size <= allocation->value.size - offset;
-    assert(range_fits && "GPU range exceeds its live gpu_malloc allocation");
-    if (!range_fits)
+    }
+
+    const auto reserved_offset = align_up(size, reserved_alignment);
+    if (reserved_offset > maximum_size ||
+        reserved_size > maximum_size - reserved_offset)
+    {
         return {};
-    return {
-        .allocation = allocation,
-        .address = address,
-        .size = range.size,
+    }
+    const auto bind_size = reserved_offset + reserved_size;
+
+    auto allocation = std::make_unique<DescriptorAllocation>(this);
+    const auto error = create_backing_buffer(
+        allocation->backing,
+        bind_size,
+        universal_buffer_usage() | VK_BUFFER_USAGE_DESCRIPTOR_HEAP_BIT_EXT,
+        cpu_visible_memory_properties,
+        0);
+    if (error != Error::none)
+        return {};
+
+    const bool valid_backing = allocation->backing.mapped != nullptr &&
+                               allocation->backing.address % heap_alignment == 0;
+    assert(valid_backing && "descriptor heap backing address is invalid");
+    if (!valid_backing)
+        return {};
+
+    allocation->value = {
+        .cpu_ptr = allocation->backing.mapped,
+        .gpu_ptr = reinterpret_cast<void*>(
+            static_cast<std::uintptr_t>(allocation->backing.address)),
+        .size = size,
     };
+    const auto result = allocation->value;
+    descriptor_allocations.push_back(std::move(allocation));
+    return result;
 }
 
 void DeviceState::release_allocation(GpuAllocation allocation) noexcept
@@ -1086,79 +1104,94 @@ void DeviceState::release_allocation(GpuAllocation allocation) noexcept
         return;
     }
 
-    const auto address = static_cast<VkDeviceAddress>(
-        reinterpret_cast<std::uintptr_t>(allocation.gpu_ptr));
-    std::shared_ptr<AllocationRecord> record;
+    const auto entry = std::ranges::find_if(
+        allocations,
+        [&](const AllocationRecord& record) {
+            return record.value.gpu_ptr == allocation.gpu_ptr;
+        });
+    if (entry != allocations.end())
     {
-        const std::scoped_lock lock(allocation_mutex);
-        const auto entry = allocations.find(address);
-        const bool found = entry != allocations.end();
-        assert(found && "gpu_free requires a live allocation returned by gpu_malloc");
-        if (!found)
-            return;
-        record = entry->second;
-        const bool matches = record->value.cpu_ptr == allocation.cpu_ptr &&
-                             record->value.gpu_ptr == allocation.gpu_ptr &&
-                             record->value.size == allocation.size;
+        const auto& record = *entry;
+        const bool matches = record.value.cpu_ptr == allocation.cpu_ptr &&
+                             record.value.gpu_ptr == allocation.gpu_ptr &&
+                             record.value.size == allocation.size;
         assert(matches &&
                "gpu_free allocation fields do not match the original gpu_malloc result");
         if (!matches)
             return;
+        assert(record.heap && "GPU allocation record has no owning heap");
+        if (!record.heap)
+            return;
+        record.heap->offsets.free(record.offset_allocation);
         allocations.erase(entry);
-    }
-}
-
-void DeviceState::free_suballocation(AllocationRecord& allocation) noexcept
-{
-    const std::scoped_lock lock(allocation_mutex);
-    if (!allocation.owns_suballocation || !allocation.heap)
         return;
-    allocation.heap->offsets.free(allocation.offset_allocation);
-    allocation.owns_suballocation = false;
+    }
+
+    const auto descriptor_entry = std::ranges::find_if(
+        descriptor_allocations,
+        [&](const std::unique_ptr<DescriptorAllocation>& record) {
+            return record->value.gpu_ptr == allocation.gpu_ptr;
+        });
+    const bool found = descriptor_entry != descriptor_allocations.end();
+    assert(found && "gpu_free requires a live allocation returned by a GPU allocator");
+    if (!found)
+        return;
+    const auto& record = **descriptor_entry;
+    const bool matches = record.value.cpu_ptr == allocation.cpu_ptr &&
+                         record.value.gpu_ptr == allocation.gpu_ptr &&
+                         record.value.size == allocation.size;
+    assert(matches &&
+           "gpu_free allocation fields do not match the original descriptor heap allocation");
+    if (!matches)
+        return;
+    descriptor_allocations.erase(descriptor_entry);
 }
 
 } // namespace detail
 
 struct Texture::Impl
 {
-    std::shared_ptr<detail::DeviceState> state;
+    detail::DeviceState* state = nullptr;
     VkImage image = VK_NULL_HANDLE;
-    VkDeviceMemory memory = VK_NULL_HANDLE;
+    VkDeviceMemory dedicated_memory = VK_NULL_HANDLE;
+    detail::ImageHeap* heap = nullptr;
+    OffsetAllocator::Allocation heap_allocation{};
     VkImageView view = VK_NULL_HANDLE;
     TextureDesc desc;
-    std::uint32_t sampled_index = invalid_heap_index;
-    std::uint32_t storage_index = invalid_heap_index;
+    bool owns_heap_allocation = false;
+    detail::TextureInitialization initialization;
 
     ~Impl()
     {
         if (!state)
             return;
-        state->resource_heap.release(sampled_index);
-        state->resource_heap.release(storage_index);
+        if (initialization.owner)
+        {
+            auto& owner = *initialization.owner;
+            const auto entry = std::ranges::find(owner, &initialization);
+            assert(entry != owner.end() &&
+                   "texture initialization owner does not contain the texture");
+            if (entry != owner.end())
+                owner.erase(entry);
+            initialization.owner = nullptr;
+        }
         if (view)
             vkDestroyImageView(state->device, view, nullptr);
         if (image)
             vkDestroyImage(state->device, image, nullptr);
-        if (memory)
-            state->free_memory(memory);
-    }
-};
-
-struct Sampler::Impl
-{
-    std::shared_ptr<detail::DeviceState> state;
-    std::uint32_t index = invalid_heap_index;
-
-    ~Impl()
-    {
-        if (state)
-            state->sampler_heap.release(index);
+        if (owns_heap_allocation)
+        {
+            assert(heap);
+            heap->offsets.free(heap_allocation);
+        }
+        if (dedicated_memory)
+            state->free_memory(dedicated_memory);
     }
 };
 
 struct Pipeline::Impl
 {
-    std::shared_ptr<detail::DeviceState> state;
+    detail::DeviceState* state = nullptr;
     VkPipeline pipeline = VK_NULL_HANDLE;
     VkPipelineBindPoint bind_point = VK_PIPELINE_BIND_POINT_GRAPHICS;
     Format color_format = Format::rgba8_unorm;
@@ -1174,35 +1207,152 @@ struct Pipeline::Impl
 
 struct CommandList::Impl
 {
-    std::shared_ptr<detail::DeviceState> state;
-    VkCommandPool command_pool = VK_NULL_HANDLE;
+    detail::DeviceState* state = nullptr;
+    detail::FrameContext* frame = nullptr;
     VkCommandBuffer command_buffer = VK_NULL_HANDLE;
     bool recording = true;
     bool rendering = false;
     Format rendering_color_format = Format::rgba8_unorm;
     Format rendering_depth_format = Format::d32_float;
     bool rendering_has_depth = false;
-    std::shared_ptr<Pipeline::Impl> bound_graphics;
-    std::shared_ptr<Pipeline::Impl> bound_compute;
-    std::vector<std::shared_ptr<void>> retained_resources;
+    Pipeline::Impl* bound_graphics = nullptr;
+    Pipeline::Impl* bound_compute = nullptr;
+    std::vector<detail::TextureInitialization*> pending_texture_initializations;
 
     ~Impl()
     {
-        if (!state || !command_pool)
-            return;
-        vkDestroyCommandPool(state->device, command_pool, nullptr);
+        if (state && !pending_texture_initializations.empty())
+        {
+            for (auto* initialization : pending_texture_initializations)
+            {
+                if (!initialization)
+                    continue;
+                assert(!initialization->initialized);
+                assert(initialization->owner == &pending_texture_initializations);
+                initialization->owner = &state->pending_texture_initializations;
+                state->pending_texture_initializations.push_back(initialization);
+            }
+            pending_texture_initializations.clear();
+        }
+        if (frame)
+        {
+            assert(frame->last_signal == 0);
+            const auto error = state->reset_frame_commands(*frame);
+            assert(error == Error::none &&
+                   "failed to reset an abandoned command pool");
+            (void)error;
+            frame->active = false;
+        }
     }
+
 };
 
 struct CommandList::AddressRange
 {
     VkDeviceAddress address = 0;
     VkDeviceSize size = 0;
-    std::shared_ptr<detail::AllocationRecord> allocation;
 };
 
 namespace
 {
+
+template<typename CommandImplementation, typename TextureImplementation>
+void initialize_texture(CommandImplementation& commands,
+                         TextureImplementation& texture,
+                         VkPipelineStageFlags2 destination_stages,
+                         VkAccessFlags2 destination_access) noexcept
+{
+    auto& initialization = texture.initialization;
+    if (initialization.initialized ||
+        initialization.owner == &commands.pending_texture_initializations)
+        return;
+
+    const bool globally_pending =
+        commands.state &&
+        initialization.owner == &commands.state->pending_texture_initializations;
+    assert(globally_pending &&
+           "texture initialization belongs to another command list");
+    if (!globally_pending)
+        return;
+    auto& global = commands.state->pending_texture_initializations;
+    const auto pending_entry = std::ranges::find(global, &initialization);
+    assert(pending_entry != global.end());
+    if (pending_entry == global.end())
+        return;
+    global.erase(pending_entry);
+    commands.pending_texture_initializations.push_back(&initialization);
+    initialization.owner = &commands.pending_texture_initializations;
+
+    const VkImageMemoryBarrier2 image_barrier{
+        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+        .pNext = nullptr,
+        .srcStageMask = VK_PIPELINE_STAGE_2_NONE,
+        .srcAccessMask = 0,
+        .dstStageMask = destination_stages,
+        .dstAccessMask = destination_access,
+        .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+        .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .image = initialization.image,
+        .subresourceRange = {
+            .aspectMask = initialization.aspect_mask,
+            .baseMipLevel = 0,
+            .levelCount = initialization.mip_levels,
+            .baseArrayLayer = 0,
+            .layerCount = 1,
+        },
+    };
+    const VkDependencyInfo dependency{
+        .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+        .pNext = nullptr,
+        .dependencyFlags = 0,
+        .memoryBarrierCount = 0,
+        .pMemoryBarriers = nullptr,
+        .bufferMemoryBarrierCount = 0,
+        .pBufferMemoryBarriers = nullptr,
+        .imageMemoryBarrierCount = 1,
+        .pImageMemoryBarriers = &image_barrier,
+    };
+    vkCmdPipelineBarrier2(commands.command_buffer, &dependency);
+}
+
+bool make_heap_bind_info(GpuRange heap,
+                         VkDeviceSize heap_alignment,
+                         VkDeviceSize reserved_alignment,
+                         VkDeviceSize reserved_size,
+                         VkDeviceSize maximum_size,
+                         VkBindHeapInfoEXT& output) noexcept
+{
+    const bool nonempty = heap.gpu_ptr && heap.size != 0;
+    assert(nonempty && "descriptor heap range must be non-empty");
+    if (!nonempty || reserved_alignment == 0 || heap_alignment == 0 ||
+        heap.size > std::numeric_limits<VkDeviceSize>::max() -
+                        (reserved_alignment - 1))
+    {
+        return false;
+    }
+    const auto address = static_cast<VkDeviceAddress>(
+        reinterpret_cast<std::uintptr_t>(heap.gpu_ptr));
+    const auto reserved_offset = align_up<VkDeviceSize>(heap.size, reserved_alignment);
+    const auto total_size = reserved_offset + reserved_size;
+    const bool valid = address % heap_alignment == 0 &&
+                       reserved_offset <= maximum_size &&
+                       reserved_size <= maximum_size - reserved_offset &&
+                       address <= std::numeric_limits<VkDeviceAddress>::max() - total_size;
+    assert(valid &&
+           "descriptor heap address, user size, or implementation reservation is invalid");
+    if (!valid)
+        return false;
+    output = {
+        .sType = VK_STRUCTURE_TYPE_BIND_HEAP_INFO_EXT,
+        .pNext = nullptr,
+        .heapRange = {address, total_size},
+        .reservedRangeOffset = reserved_offset,
+        .reservedRangeSize = reserved_size,
+    };
+    return true;
+}
 
 Error enumerate_device_extensions(VkPhysicalDevice physical_device,
                                   std::vector<VkExtensionProperties>& values) noexcept
@@ -1227,6 +1377,7 @@ Error enumerate_device_extensions(VkPhysicalDevice physical_device,
     }
 }
 
+#if !defined(NDEBUG)
 Error enumerate_instance_extensions(std::vector<VkExtensionProperties>& values) noexcept
 {
     for (;;)
@@ -1268,6 +1419,7 @@ Error enumerate_instance_layers(std::vector<VkLayerProperties>& values) noexcept
         return Error::none;
     }
 }
+#endif
 
 struct QueriedFeatures
 {
@@ -1358,9 +1510,9 @@ Error inspect_candidate(VkPhysicalDevice physical_device, Candidate& output) noe
         features.vulkan11.storagePushConstant16 == VK_TRUE &&
         features.vulkan11.shaderDrawParameters == VK_TRUE &&
         features.vulkan12.shaderFloat16 == VK_TRUE &&
-        features.vulkan12.runtimeDescriptorArray == VK_TRUE &&
         features.vulkan12.scalarBlockLayout == VK_TRUE &&
         features.vulkan12.bufferDeviceAddress == VK_TRUE &&
+        features.vulkan12.timelineSemaphore == VK_TRUE &&
         features.vulkan13.synchronization2 == VK_TRUE &&
         features.vulkan13.dynamicRendering == VK_TRUE &&
         features.vulkan14.maintenance5 == VK_TRUE &&
@@ -1418,60 +1570,6 @@ Error create_shader_module(VkDevice device,
     return error_from_vk(vkCreateShaderModule(device, &info, nullptr, &output));
 }
 
-std::array<VkDescriptorSetAndBindingMappingEXT, 3> make_standard_mappings(
-    const detail::DeviceState& state)
-{
-    VkDescriptorMappingSourceDataEXT texture_data{};
-    texture_data.constantOffset = {
-        .heapOffset = 0,
-        .heapArrayStride = static_cast<std::uint32_t>(state.resource_heap.descriptor_size),
-        .pEmbeddedSampler = nullptr,
-        .samplerHeapOffset = 0,
-        .samplerHeapArrayStride = 0,
-    };
-    VkDescriptorMappingSourceDataEXT sampler_data{};
-    sampler_data.constantOffset = {
-        .heapOffset = 0,
-        .heapArrayStride = static_cast<std::uint32_t>(state.sampler_heap.descriptor_size),
-        .pEmbeddedSampler = nullptr,
-        .samplerHeapOffset = 0,
-        .samplerHeapArrayStride = 0,
-    };
-
-    return {{
-        {
-            .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_AND_BINDING_MAPPING_EXT,
-            .pNext = nullptr,
-            .descriptorSet = 0,
-            .firstBinding = 0,
-            .bindingCount = 1,
-            .resourceMask = VK_SPIRV_RESOURCE_TYPE_SAMPLED_IMAGE_BIT_EXT,
-            .source = VK_DESCRIPTOR_MAPPING_SOURCE_HEAP_WITH_CONSTANT_OFFSET_EXT,
-            .sourceData = texture_data,
-        },
-        {
-            .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_AND_BINDING_MAPPING_EXT,
-            .pNext = nullptr,
-            .descriptorSet = 0,
-            .firstBinding = 1,
-            .bindingCount = 1,
-            .resourceMask = VK_SPIRV_RESOURCE_TYPE_SAMPLER_BIT_EXT,
-            .source = VK_DESCRIPTOR_MAPPING_SOURCE_HEAP_WITH_CONSTANT_OFFSET_EXT,
-            .sourceData = sampler_data,
-        },
-        {
-            .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_AND_BINDING_MAPPING_EXT,
-            .pNext = nullptr,
-            .descriptorSet = 0,
-            .firstBinding = 2,
-            .bindingCount = 1,
-            .resourceMask = VK_SPIRV_RESOURCE_TYPE_READ_WRITE_IMAGE_BIT_EXT,
-            .source = VK_DESCRIPTOR_MAPPING_SOURCE_HEAP_WITH_CONSTANT_OFFSET_EXT,
-            .sourceData = texture_data,
-        },
-    }};
-}
-
 } // namespace
 
 Error Device::create(Device& output, const DeviceDesc& desc) noexcept
@@ -1489,7 +1587,8 @@ Error Device::create(Device& output, const DeviceDesc& desc) noexcept
     if (loader_version < VK_API_VERSION_1_4)
         return Error::unsupported;
 
-    auto state = std::make_shared<detail::DeviceState>();
+    auto state = std::make_unique<detail::DeviceState>();
+#if !defined(NDEBUG)
     std::vector<VkExtensionProperties> instance_extensions;
     error = enumerate_instance_extensions(instance_extensions);
     if (error != Error::none)
@@ -1502,13 +1601,16 @@ Error Device::create(Device& output, const DeviceDesc& desc) noexcept
         has_name(instance_extensions, VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
     const bool validation_available =
         has_name(layers, "VK_LAYER_KHRONOS_validation");
+#endif
 
     std::vector<const char*> enabled_instance_extensions;
     std::vector<const char*> enabled_layers;
-    if (desc.enable_validation && debug_utils_available)
+#if !defined(NDEBUG)
+    if (debug_utils_available)
         enabled_instance_extensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
-    if (desc.enable_validation && validation_available)
+    if (validation_available)
         enabled_layers.push_back("VK_LAYER_KHRONOS_validation");
+#endif
 
     const VkApplicationInfo app_info{
         .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
@@ -1533,7 +1635,8 @@ Error Device::create(Device& output, const DeviceDesc& desc) noexcept
     if (error != Error::none)
         return error;
 
-    if (desc.enable_validation && debug_utils_available)
+#if !defined(NDEBUG)
+    if (debug_utils_available)
     {
         const auto create_debug = load_instance_proc<PFN_vkCreateDebugUtilsMessengerEXT>(
             state->instance, "vkCreateDebugUtilsMessengerEXT");
@@ -1559,6 +1662,7 @@ Error Device::create(Device& output, const DeviceDesc& desc) noexcept
         if (error != Error::none)
             return error;
     }
+#endif
 
     std::vector<VkPhysicalDevice> physical_devices;
     for (;;)
@@ -1631,8 +1735,8 @@ Error Device::create(Device& output, const DeviceDesc& desc) noexcept
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
         .pNext = &enabled_features.vulkan13,
         .shaderFloat16 = VK_TRUE,
-        .runtimeDescriptorArray = VK_TRUE,
         .scalarBlockLayout = VK_TRUE,
+        .timelineSemaphore = VK_TRUE,
         .bufferDeviceAddress = VK_TRUE,
     };
     enabled_features.vulkan13 = {
@@ -1702,6 +1806,30 @@ Error Device::create(Device& output, const DeviceDesc& desc) noexcept
         return error;
     vkGetDeviceQueue(state->device, state->queue_family, 0, &state->queue);
 
+    const VkSemaphoreTypeCreateInfo timeline_type{
+        .sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO,
+        .pNext = nullptr,
+        .semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE,
+        .initialValue = 0,
+    };
+    const VkSemaphoreCreateInfo semaphore_info{
+        .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
+        .pNext = &timeline_type,
+        .flags = 0,
+    };
+    error = error_from_vk(
+        vkCreateSemaphore(state->device, &semaphore_info, nullptr, &state->timeline));
+    if (error != Error::none)
+        return error;
+
+    for (auto& frame : state->frames)
+    {
+        error = state->create_frame_commands(frame);
+        if (error != Error::none)
+            return error;
+        frame.command_list_storage = ::operator new(sizeof(CommandList::Impl));
+    }
+
     state->fn.write_sampler_descriptors =
         load_device_proc<PFN_vkWriteSamplerDescriptorsEXT>(
             state->device, "vkWriteSamplerDescriptorsEXT");
@@ -1739,37 +1867,12 @@ Error Device::create(Device& output, const DeviceDesc& desc) noexcept
         return Error::driver_error;
     }
 
-    error = state->initialize_heap(
-        state->resource_heap,
-        desc.texture_capacity,
-        state->heap_properties.imageDescriptorSize,
-        state->heap_properties.imageDescriptorAlignment,
-        state->heap_properties.resourceHeapAlignment,
-        state->heap_properties.minResourceHeapReservedRange,
-        state->heap_properties.maxResourceHeapSize);
-    if (error != Error::none)
-        return error;
-    error = state->initialize_heap(
-        state->sampler_heap,
-        desc.sampler_capacity,
-        state->heap_properties.samplerDescriptorSize,
-        state->heap_properties.samplerDescriptorAlignment,
-        state->heap_properties.samplerHeapAlignment,
-        state->heap_properties.minSamplerHeapReservedRange,
-        state->heap_properties.maxSamplerHeapSize);
-    if (error != Error::none)
-        return error;
-
     state->caps = {
         .device_name = state->physical_properties.deviceName,
         .api_version = state->physical_properties.apiVersion,
-        .max_push_data_size = static_cast<std::uint32_t>(std::min<VkDeviceSize>(
-            state->heap_properties.maxPushDataSize,
-            std::numeric_limits<std::uint32_t>::max())),
+        .max_push_data_size = state->heap_properties.maxPushDataSize,
         .image_descriptor_size = state->heap_properties.imageDescriptorSize,
         .sampler_descriptor_size = state->heap_properties.samplerDescriptorSize,
-        .first_texture_index = state->resource_heap.first_index,
-        .first_sampler_index = state->sampler_heap.first_index,
     };
     output = Device{std::move(state)};
     return Error::none;
@@ -1782,7 +1885,27 @@ GpuAllocation Device::gpu_malloc(std::uint64_t byte_count,
     assert(impl_ && "gpu_malloc called on an empty device");
     if (!impl_)
         return {};
-    return impl_->allocate_gpu(impl_, byte_count, memory, alignment);
+    return impl_->allocate_gpu(byte_count, memory, alignment);
+}
+
+GpuAllocation Device::gpu_malloc_resource_heap(
+    std::uint64_t byte_count) const noexcept
+{
+    assert(impl_ && "gpu_malloc_resource_heap called on an empty device");
+    if (!impl_)
+        return {};
+    return impl_->allocate_descriptor_heap(
+        byte_count, detail::DescriptorHeapType::resource);
+}
+
+GpuAllocation Device::gpu_malloc_sampler_heap(
+    std::uint64_t byte_count) const noexcept
+{
+    assert(impl_ && "gpu_malloc_sampler_heap called on an empty device");
+    if (!impl_)
+        return {};
+    return impl_->allocate_descriptor_heap(
+        byte_count, detail::DescriptorHeapType::sampler);
 }
 
 void Device::gpu_free(GpuAllocation allocation) const noexcept
@@ -1799,6 +1922,14 @@ Error Device::create_texture(Texture& output, const TextureDesc& desc) const noe
 {
     assert(!output && "create_texture output must be empty");
     assert(impl_ && "create_texture called on an empty device");
+    if (!impl_)
+        return Error::driver_error;
+    const bool commands_recording = std::ranges::any_of(
+        impl_->frames, [](const detail::FrameContext& frame) { return frame.active; });
+    assert(!commands_recording &&
+           "create_texture is not allowed while a command list is recording");
+    if (commands_recording)
+        return Error::driver_error;
     assert(desc.width != 0 && desc.height != 0 && desc.depth != 0 &&
            desc.mip_levels != 0 && "texture dimensions and mip count must be non-zero");
     const auto maximum_mip_levels = static_cast<std::uint32_t>(
@@ -1857,8 +1988,8 @@ Error Device::create_texture(Texture& output, const TextureDesc& desc) const noe
         }
     }
 
-    auto result = std::make_shared<Texture::Impl>();
-    result->state = impl_;
+    auto result = std::make_unique<Texture::Impl>();
+    result->state = impl_.get();
     result->desc = desc;
     result->desc.name = {};
 
@@ -1929,193 +2060,254 @@ Error Device::create_texture(Texture& output, const TextureDesc& desc) const noe
     if (error != Error::none)
         return error;
 
-    VkMemoryRequirements requirements{};
-    vkGetImageMemoryRequirements(impl_->device, result->image, &requirements);
+    VkMemoryDedicatedRequirements dedicated_requirements{
+        .sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_REQUIREMENTS,
+        .pNext = nullptr,
+    };
+    VkMemoryRequirements2 requirements2{
+        .sType = VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2,
+        .pNext = &dedicated_requirements,
+    };
+    const VkImageMemoryRequirementsInfo2 requirements_info{
+        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_REQUIREMENTS_INFO_2,
+        .pNext = nullptr,
+        .image = result->image,
+    };
+    vkGetImageMemoryRequirements2(impl_->device, &requirements_info, &requirements2);
+    const auto& requirements = requirements2.memoryRequirements;
+    const bool padded_fits = requirements.size <= allocation_heap_size &&
+                             requirements.alignment != 0 &&
+                             requirements.alignment - 1 <=
+                                 allocation_heap_size - requirements.size;
+    const bool dedicated = dedicated_requirements.requiresDedicatedAllocation ||
+                           !padded_fits;
     std::uint32_t memory_type = 0;
     if (!impl_->find_memory_type(
-        requirements.memoryTypeBits,
-        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
-        0,
-        memory_type,
-        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT))
+            requirements.memoryTypeBits,
+            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+            0,
+            dedicated ? requirements.size : allocation_heap_size,
+            memory_type,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT))
     {
         return Error::unsupported;
     }
-    const VkMemoryDedicatedAllocateInfo dedicated_info{
-        .sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO,
-        .pNext = nullptr,
-        .image = result->image,
-        .buffer = VK_NULL_HANDLE,
-    };
-    const VkMemoryAllocateInfo allocate_info{
-        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
-        .pNext = &dedicated_info,
-        .allocationSize = requirements.size,
-        .memoryTypeIndex = memory_type,
-    };
-    error = impl_->allocate_memory(allocate_info, result->memory);
-    if (error != Error::none)
-        return error;
-    error = error_from_vk(
-        vkBindImageMemory(impl_->device, result->image, result->memory, 0));
-    if (error != Error::none)
-        return error;
+
+    if (dedicated)
+    {
+        const VkMemoryDedicatedAllocateInfo dedicated_info{
+            .sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO,
+            .pNext = nullptr,
+            .image = result->image,
+            .buffer = VK_NULL_HANDLE,
+        };
+        const VkMemoryAllocateInfo allocate_info{
+            .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+            .pNext = &dedicated_info,
+            .allocationSize = requirements.size,
+            .memoryTypeIndex = memory_type,
+        };
+        error = impl_->allocate_memory(allocate_info, result->dedicated_memory);
+        if (error != Error::none)
+            return error;
+        error = error_from_vk(vkBindImageMemory(
+            impl_->device, result->image, result->dedicated_memory, 0));
+        if (error != Error::none)
+            return error;
+    }
+    else
+    {
+        const auto padded_size = static_cast<std::uint32_t>(
+            requirements.size + requirements.alignment - 1);
+        const auto try_suballocate = [&](detail::ImageHeap& heap) {
+            if (heap.memory_type != memory_type)
+                return false;
+            const auto token = heap.offsets.allocate(padded_size);
+            if (token.offset == OffsetAllocator::Allocation::NO_SPACE)
+                return false;
+            const auto memory_offset = align_up(
+                static_cast<VkDeviceSize>(token.offset), requirements.alignment);
+            const bool valid_range = memory_offset <= allocation_heap_size &&
+                                     requirements.size <=
+                                         allocation_heap_size - memory_offset;
+            assert(valid_range && "image suballocation range is invalid");
+            if (!valid_range)
+            {
+                heap.offsets.free(token);
+                return false;
+            }
+            result->heap = &heap;
+            result->heap_allocation = token;
+            result->owns_heap_allocation = true;
+            error = error_from_vk(vkBindImageMemory(
+                impl_->device, result->image, heap.memory, memory_offset));
+            return true;
+        };
+
+        bool allocated = false;
+        for (const auto& heap : impl_->image_heaps)
+        {
+            if (try_suballocate(*heap))
+            {
+                allocated = true;
+                break;
+            }
+        }
+        if (!allocated)
+        {
+            auto heap = std::make_unique<detail::ImageHeap>(impl_.get(), memory_type);
+            const VkMemoryAllocateInfo allocate_info{
+                .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+                .pNext = nullptr,
+                .allocationSize = allocation_heap_size,
+                .memoryTypeIndex = memory_type,
+            };
+            error = impl_->allocate_memory(allocate_info, heap->memory);
+            if (error != Error::none)
+                return error;
+            auto* heap_pointer = heap.get();
+            impl_->image_heaps.push_back(std::move(heap));
+            allocated = try_suballocate(*heap_pointer);
+            assert(allocated && "a new image heap could not satisfy its first allocation");
+            if (!allocated)
+                return Error::driver_error;
+        }
+        if (error != Error::none)
+            return error;
+    }
 
     const bool depth = desc.format == Format::d32_float;
     const auto aspect_mask = static_cast<VkImageAspectFlags>(
         depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT);
 
-    // VK_KHR_unified_image_layouts removes transitions between ordinary layouts,
-    // but the specification still requires one transition out of UNDEFINED to
-    // initialize image metadata. Keep that Vulkan detail out of the public API.
-    CommandList initialization;
-    error = begin_commands(initialization);
-    if (error != Error::none)
-        return error;
-    const VkImageMemoryBarrier2 image_barrier{
-        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
-        .pNext = nullptr,
-        .srcStageMask = VK_PIPELINE_STAGE_2_NONE,
-        .srcAccessMask = 0,
-        .dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
-        .dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT,
-        .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
-        .newLayout = VK_IMAGE_LAYOUT_GENERAL,
-        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-        .image = result->image,
-        .subresourceRange = {
-            .aspectMask = aspect_mask,
-            .baseMipLevel = 0,
-            .levelCount = desc.mip_levels,
-            .baseArrayLayer = 0,
-            .layerCount = 1,
-        },
-    };
-    const VkDependencyInfo dependency{
-        .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
-        .pNext = nullptr,
-        .dependencyFlags = 0,
-        .memoryBarrierCount = 0,
-        .pMemoryBarriers = nullptr,
-        .bufferMemoryBarrierCount = 0,
-        .pBufferMemoryBarriers = nullptr,
-        .imageMemoryBarrierCount = 1,
-        .pImageMemoryBarriers = &image_barrier,
-    };
-    vkCmdPipelineBarrier2(initialization.impl_->command_buffer, &dependency);
-    error = submit_and_wait(std::move(initialization));
-    if (error != Error::none)
-        return error;
-
-    const VkImageViewCreateInfo view_info{
-        .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
-        .pNext = nullptr,
-        .flags = 0,
-        .image = result->image,
-        .viewType = desc.depth > 1 ? VK_IMAGE_VIEW_TYPE_3D : VK_IMAGE_VIEW_TYPE_2D,
-        .format = to_vk(desc.format),
-        .components = {},
-        .subresourceRange = {
-            .aspectMask = aspect_mask,
-            .baseMipLevel = 0,
-            .levelCount = desc.mip_levels,
-            .baseArrayLayer = 0,
-            .layerCount = 1,
-        },
-    };
-    error = error_from_vk(
-        vkCreateImageView(impl_->device, &view_info, nullptr, &result->view));
-    if (error != Error::none)
-        return error;
-
-    if (has_flag(desc.usage, TextureUsage::sampled))
+    if (attachment)
     {
-        result->sampled_index = impl_->resource_heap.allocate();
-        if (result->sampled_index == invalid_heap_index)
-            return Error::out_of_descriptors;
-        const VkImageDescriptorInfoEXT image_descriptor{
-            .sType = VK_STRUCTURE_TYPE_IMAGE_DESCRIPTOR_INFO_EXT,
+        const VkImageViewCreateInfo view_info{
+            .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
             .pNext = nullptr,
-            .pView = &view_info,
-            .layout = VK_IMAGE_LAYOUT_GENERAL,
+            .flags = 0,
+            .image = result->image,
+            .viewType = VK_IMAGE_VIEW_TYPE_2D,
+            .format = to_vk(desc.format),
+            .components = {},
+            .subresourceRange = {
+                .aspectMask = aspect_mask,
+                .baseMipLevel = 0,
+                .levelCount = 1,
+                .baseArrayLayer = 0,
+                .layerCount = 1,
+            },
         };
-        VkResourceDescriptorDataEXT data{};
-        data.pImage = &image_descriptor;
-        const VkResourceDescriptorInfoEXT descriptor_info{
-            .sType = VK_STRUCTURE_TYPE_RESOURCE_DESCRIPTOR_INFO_EXT,
-            .pNext = nullptr,
-            .type = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
-            .data = data,
-        };
-        const VkHostAddressRangeEXT destination{
-            .address = impl_->resource_heap.host_address(result->sampled_index),
-            .size = static_cast<std::size_t>(impl_->resource_heap.descriptor_size),
-        };
-        {
-            const std::scoped_lock lock(impl_->resource_heap.mutex);
-            error = error_from_vk(impl_->fn.write_resource_descriptors(
-                impl_->device, 1, &descriptor_info, &destination));
-            if (error != Error::none)
-                return error;
-        }
+        error = error_from_vk(
+            vkCreateImageView(impl_->device, &view_info, nullptr, &result->view));
+        if (error != Error::none)
+            return error;
     }
 
-    if (has_flag(desc.usage, TextureUsage::storage))
-    {
-        result->storage_index = impl_->resource_heap.allocate();
-        if (result->storage_index == invalid_heap_index)
-            return Error::out_of_descriptors;
-        const VkImageDescriptorInfoEXT image_descriptor{
-            .sType = VK_STRUCTURE_TYPE_IMAGE_DESCRIPTOR_INFO_EXT,
-            .pNext = nullptr,
-            .pView = &view_info,
-            .layout = VK_IMAGE_LAYOUT_GENERAL,
-        };
-        VkResourceDescriptorDataEXT data{};
-        data.pImage = &image_descriptor;
-        const VkResourceDescriptorInfoEXT descriptor_info{
-            .sType = VK_STRUCTURE_TYPE_RESOURCE_DESCRIPTOR_INFO_EXT,
-            .pNext = nullptr,
-            .type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
-            .data = data,
-        };
-        const VkHostAddressRangeEXT destination{
-            .address = impl_->resource_heap.host_address(result->storage_index),
-            .size = static_cast<std::size_t>(impl_->resource_heap.descriptor_size),
-        };
-        {
-            const std::scoped_lock lock(impl_->resource_heap.mutex);
-            error = error_from_vk(impl_->fn.write_resource_descriptors(
-                impl_->device, 1, &descriptor_info, &destination));
-            if (error != Error::none)
-                return error;
-        }
-    }
-
+    result->initialization = {
+        .image = result->image,
+        .aspect_mask = aspect_mask,
+        .mip_levels = desc.mip_levels,
+        .initialized = false,
+        .owner = &impl_->pending_texture_initializations,
+    };
+    impl_->pending_texture_initializations.push_back(&result->initialization);
     output = Texture{std::move(result)};
     return Error::none;
 }
 
-Error Device::create_sampler(Sampler& output, const SamplerDesc& desc) const noexcept
+Error Device::write_texture_descriptor(void* cpu_destination,
+                                       const Texture& texture,
+                                       TextureDescriptorType type,
+                                       const TextureViewDesc& view) const noexcept
 {
-    assert(!output && "create_sampler output must be empty");
-    assert(impl_ && "create_sampler called on an empty device");
-    if (!impl_)
+    const bool valid = impl_ && texture.impl_ && cpu_destination &&
+                       texture.impl_->state == impl_.get();
+    assert(valid &&
+           "write_texture_descriptor requires a destination and texture from this device");
+    if (!valid)
         return Error::driver_error;
 
-    auto result = std::make_unique<Sampler::Impl>();
-    result->state = impl_;
-    result->index = impl_->sampler_heap.allocate();
-    if (result->index == invalid_heap_index)
-        return Error::out_of_descriptors;
+    const auto required_usage = type == TextureDescriptorType::sampled
+        ? TextureUsage::sampled
+        : TextureUsage::storage;
+    const bool valid_type = type == TextureDescriptorType::sampled ||
+                            type == TextureDescriptorType::storage;
+    const bool valid_usage = valid_type &&
+                             has_flag(texture.impl_->desc.usage, required_usage);
+    const bool valid_base_mip = view.base_mip < texture.impl_->desc.mip_levels;
+    const auto mip_count = valid_base_mip
+        ? (view.mip_count == 0
+               ? texture.impl_->desc.mip_levels - view.base_mip
+               : view.mip_count)
+        : 0;
+    const bool valid_mips = valid_base_mip && mip_count != 0 &&
+                            mip_count <= texture.impl_->desc.mip_levels - view.base_mip;
+    assert(valid_usage && "texture was not created for this descriptor type");
+    assert(valid_mips && "texture descriptor mip range is invalid");
+    if (!valid_usage || !valid_mips)
+        return Error::driver_error;
+
+    const bool depth = texture.impl_->desc.format == Format::d32_float;
+    const VkImageViewCreateInfo view_info{
+        .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+        .pNext = nullptr,
+        .flags = 0,
+        .image = texture.impl_->image,
+        .viewType = texture.impl_->desc.depth > 1
+            ? VK_IMAGE_VIEW_TYPE_3D
+            : VK_IMAGE_VIEW_TYPE_2D,
+        .format = to_vk(texture.impl_->desc.format),
+        .components = {},
+        .subresourceRange = {
+            .aspectMask = static_cast<VkImageAspectFlags>(
+                depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT),
+            .baseMipLevel = view.base_mip,
+            .levelCount = mip_count,
+            .baseArrayLayer = 0,
+            .layerCount = 1,
+        },
+    };
+    const VkImageDescriptorInfoEXT image_descriptor{
+        .sType = VK_STRUCTURE_TYPE_IMAGE_DESCRIPTOR_INFO_EXT,
+        .pNext = nullptr,
+        .pView = &view_info,
+        .layout = VK_IMAGE_LAYOUT_GENERAL,
+    };
+    VkResourceDescriptorDataEXT data{};
+    data.pImage = &image_descriptor;
+    const VkResourceDescriptorInfoEXT descriptor_info{
+        .sType = VK_STRUCTURE_TYPE_RESOURCE_DESCRIPTOR_INFO_EXT,
+        .pNext = nullptr,
+        .type = type == TextureDescriptorType::sampled
+            ? VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE
+            : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+        .data = data,
+    };
+    const VkHostAddressRangeEXT destination{
+        .address = cpu_destination,
+        .size = static_cast<std::size_t>(impl_->heap_properties.imageDescriptorSize),
+    };
+    return error_from_vk(impl_->fn.write_resource_descriptors(
+        impl_->device, 1, &descriptor_info, &destination));
+}
+
+Error Device::write_sampler_descriptor(void* cpu_destination,
+                                       const SamplerDesc& desc) const noexcept
+{
+    const bool valid = impl_ && cpu_destination;
+    assert(valid && "write_sampler_descriptor requires a valid device and destination");
+    if (!valid)
+        return Error::driver_error;
     const VkSamplerCreateInfo sampler_info{
         .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
         .pNext = nullptr,
         .flags = 0,
         .magFilter = to_vk(desc.mag_filter),
         .minFilter = to_vk(desc.min_filter),
-        .mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR,
+        .mipmapMode = desc.min_filter == Filter::nearest
+            ? VK_SAMPLER_MIPMAP_MODE_NEAREST
+            : VK_SAMPLER_MIPMAP_MODE_LINEAR,
         .addressModeU = to_vk(desc.address_u),
         .addressModeV = to_vk(desc.address_v),
         .addressModeW = to_vk(desc.address_w),
@@ -2130,18 +2322,11 @@ Error Device::create_sampler(Sampler& output, const SamplerDesc& desc) const noe
         .unnormalizedCoordinates = VK_FALSE,
     };
     const VkHostAddressRangeEXT destination{
-        .address = impl_->sampler_heap.host_address(result->index),
-        .size = static_cast<std::size_t>(impl_->sampler_heap.descriptor_size),
+        .address = cpu_destination,
+        .size = static_cast<std::size_t>(impl_->heap_properties.samplerDescriptorSize),
     };
-    {
-        const std::scoped_lock lock(impl_->sampler_heap.mutex);
-        const auto error = error_from_vk(impl_->fn.write_sampler_descriptors(
-            impl_->device, 1, &sampler_info, &destination));
-        if (error != Error::none)
-            return error;
-    }
-    output = Sampler{std::move(result)};
-    return Error::none;
+    return error_from_vk(impl_->fn.write_sampler_descriptors(
+        impl_->device, 1, &sampler_info, &destination));
 }
 
 Error Device::create_graphics_pipeline(Pipeline& output,
@@ -2185,25 +2370,10 @@ Error Device::create_graphics_pipeline(Pipeline& output,
         return error;
     }
 
-        const auto mappings = make_standard_mappings(*impl_);
-        std::array mapping_infos{
-            VkShaderDescriptorSetAndBindingMappingInfoEXT{
-                .sType = VK_STRUCTURE_TYPE_SHADER_DESCRIPTOR_SET_AND_BINDING_MAPPING_INFO_EXT,
-                .pNext = nullptr,
-                .mappingCount = static_cast<std::uint32_t>(mappings.size()),
-                .pMappings = mappings.data(),
-            },
-            VkShaderDescriptorSetAndBindingMappingInfoEXT{
-                .sType = VK_STRUCTURE_TYPE_SHADER_DESCRIPTOR_SET_AND_BINDING_MAPPING_INFO_EXT,
-                .pNext = nullptr,
-                .mappingCount = static_cast<std::uint32_t>(mappings.size()),
-                .pMappings = mappings.data(),
-            },
-        };
         const std::array stages{
             VkPipelineShaderStageCreateInfo{
                 .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-                .pNext = &mapping_infos[0],
+                .pNext = nullptr,
                 .flags = 0,
                 .stage = VK_SHADER_STAGE_VERTEX_BIT,
                 .module = vertex_module,
@@ -2212,7 +2382,7 @@ Error Device::create_graphics_pipeline(Pipeline& output,
             },
             VkPipelineShaderStageCreateInfo{
                 .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-                .pNext = &mapping_infos[1],
+                .pNext = nullptr,
                 .flags = 0,
                 .stage = VK_SHADER_STAGE_FRAGMENT_BIT,
                 .module = fragment_module,
@@ -2356,8 +2526,8 @@ Error Device::create_graphics_pipeline(Pipeline& output,
             .basePipelineHandle = VK_NULL_HANDLE,
             .basePipelineIndex = -1,
         };
-        auto result = std::make_shared<Pipeline::Impl>();
-        result->state = impl_;
+        auto result = std::make_unique<Pipeline::Impl>();
+        result->state = impl_.get();
         result->bind_point = VK_PIPELINE_BIND_POINT_GRAPHICS;
         result->color_format = desc.color_format;
         result->depth_format = desc.depth_format;
@@ -2387,16 +2557,9 @@ Error Device::create_compute_pipeline(Pipeline& output,
     {
         return error;
     }
-        const auto mappings = make_standard_mappings(*impl_);
-        const VkShaderDescriptorSetAndBindingMappingInfoEXT mapping_info{
-            .sType = VK_STRUCTURE_TYPE_SHADER_DESCRIPTOR_SET_AND_BINDING_MAPPING_INFO_EXT,
-            .pNext = nullptr,
-            .mappingCount = static_cast<std::uint32_t>(mappings.size()),
-            .pMappings = mappings.data(),
-        };
         const VkPipelineShaderStageCreateInfo stage{
             .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-            .pNext = &mapping_info,
+            .pNext = nullptr,
             .flags = 0,
             .stage = VK_SHADER_STAGE_COMPUTE_BIT,
             .module = module,
@@ -2417,8 +2580,8 @@ Error Device::create_compute_pipeline(Pipeline& output,
             .basePipelineHandle = VK_NULL_HANDLE,
             .basePipelineIndex = -1,
         };
-        auto result = std::make_shared<Pipeline::Impl>();
-        result->state = impl_;
+        auto result = std::make_unique<Pipeline::Impl>();
+        result->state = impl_.get();
         result->bind_point = VK_PIPELINE_BIND_POINT_COMPUTE;
         error = error_from_vk(vkCreateComputePipelines(
             impl_->device, VK_NULL_HANDLE, 1, &pipeline_info, nullptr, &result->pipeline));
@@ -2436,27 +2599,38 @@ Error Device::begin_commands(CommandList& output) const noexcept
     if (!impl_)
         return Error::driver_error;
 
-    auto result = std::make_unique<CommandList::Impl>();
-    result->state = impl_;
-    const VkCommandPoolCreateInfo pool_info{
-        .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
-        .pNext = nullptr,
-        .flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT,
-        .queueFamilyIndex = impl_->queue_family,
-    };
-    auto error = error_from_vk(
-        vkCreateCommandPool(impl_->device, &pool_info, nullptr, &result->command_pool));
-    if (error != Error::none)
-        return error;
-    const VkCommandBufferAllocateInfo allocate_info{
-        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
-        .pNext = nullptr,
-        .commandPool = result->command_pool,
-        .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
-        .commandBufferCount = 1,
-    };
-    error = error_from_vk(
-        vkAllocateCommandBuffers(impl_->device, &allocate_info, &result->command_buffer));
+    const bool already_recording = std::ranges::any_of(
+        impl_->frames, [](const detail::FrameContext& frame) { return frame.active; });
+    assert(!already_recording && "clean_gfx supports one recording command list at a time");
+    if (already_recording)
+        return Error::driver_error;
+    auto& frame = impl_->frames[impl_->next_frame % impl_->frames.size()];
+    if (frame.last_signal != 0)
+    {
+        const VkSemaphoreWaitInfo wait_info{
+            .sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO,
+            .pNext = nullptr,
+            .flags = 0,
+            .semaphoreCount = 1,
+            .pSemaphores = &impl_->timeline,
+            .pValues = &frame.last_signal,
+        };
+        const auto error = error_from_vk(vkWaitSemaphores(
+            impl_->device,
+            &wait_info,
+            std::numeric_limits<std::uint64_t>::max()));
+        if (error != Error::none)
+            return error;
+        frame.last_signal = 0;
+    }
+
+    if (!frame.command_pool)
+    {
+        const auto error = impl_->create_frame_commands(frame);
+        if (error != Error::none)
+            return error;
+    }
+    auto error = impl_->reset_frame_commands(frame);
     if (error != Error::none)
         return error;
     const VkCommandBufferBeginInfo begin_info{
@@ -2465,28 +2639,77 @@ Error Device::begin_commands(CommandList& output) const noexcept
         .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
         .pInheritanceInfo = nullptr,
     };
-    error = error_from_vk(vkBeginCommandBuffer(result->command_buffer, &begin_info));
+    error = error_from_vk(vkBeginCommandBuffer(frame.command_buffer, &begin_info));
     if (error != Error::none)
         return error;
 
-    const auto sampler_bind = impl_->sampler_heap.bind_info();
-    const auto resource_bind = impl_->resource_heap.bind_info();
-    impl_->fn.cmd_bind_sampler_heap(result->command_buffer, &sampler_bind);
-    impl_->fn.cmd_bind_resource_heap(result->command_buffer, &resource_bind);
-    output = CommandList{std::move(result)};
+    assert(frame.command_list_storage && "frame command-list storage is missing");
+    auto* result = ::new (frame.command_list_storage) CommandList::Impl();
+    result->state = impl_.get();
+    result->frame = &frame;
+    result->command_buffer = frame.command_buffer;
+    result->pending_texture_initializations =
+        std::move(impl_->pending_texture_initializations);
+    if (!result->pending_texture_initializations.empty())
+    {
+        std::vector<VkImageMemoryBarrier2> barriers;
+        barriers.reserve(result->pending_texture_initializations.size());
+        for (auto* initialization : result->pending_texture_initializations)
+        {
+            assert(initialization && !initialization->initialized);
+            assert(initialization->owner == &impl_->pending_texture_initializations);
+            initialization->owner = &result->pending_texture_initializations;
+            barriers.push_back({
+                .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+                .pNext = nullptr,
+                .srcStageMask = VK_PIPELINE_STAGE_2_NONE,
+                .srcAccessMask = 0,
+                .dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                .dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT |
+                                 VK_ACCESS_2_MEMORY_WRITE_BIT,
+                .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+                .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .image = initialization->image,
+                .subresourceRange = {
+                    .aspectMask = initialization->aspect_mask,
+                    .baseMipLevel = 0,
+                    .levelCount = initialization->mip_levels,
+                    .baseArrayLayer = 0,
+                    .layerCount = 1,
+                },
+            });
+        }
+        const VkDependencyInfo dependency{
+            .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+            .pNext = nullptr,
+            .dependencyFlags = 0,
+            .memoryBarrierCount = 0,
+            .pMemoryBarriers = nullptr,
+            .bufferMemoryBarrierCount = 0,
+            .pBufferMemoryBarriers = nullptr,
+            .imageMemoryBarrierCount = static_cast<std::uint32_t>(barriers.size()),
+            .pImageMemoryBarriers = barriers.data(),
+        };
+        vkCmdPipelineBarrier2(result->command_buffer, &dependency);
+    }
+    frame.active = true;
+    output = CommandList{result};
     return Error::none;
 }
 
-Error Device::submit_and_wait(CommandList&& commands) const noexcept
+Error Device::submit(CommandList&& commands) const noexcept
 {
     assert(impl_ && commands.impl_ &&
-           "submit_and_wait received an empty device or command list");
-    assert((!impl_ || !commands.impl_ || commands.impl_->state.get() == impl_.get()) &&
+           "submit received an empty device or command list");
+    assert((!impl_ || !commands.impl_ || commands.impl_->state == impl_.get()) &&
            "command list belongs to a different device");
-    if (!impl_ || !commands.impl_ || commands.impl_->state.get() != impl_.get())
+    if (!impl_ || !commands.impl_ || commands.impl_->state != impl_.get())
         return Error::driver_error;
 
-    auto owned = std::move(commands.impl_);
+    CommandList owned_handle = std::move(commands);
+    auto* owned = owned_handle.impl_;
     if (owned->recording)
     {
         assert(!owned->rendering && "cannot submit while a rendering scope is active");
@@ -2498,38 +2721,93 @@ Error Device::submit_and_wait(CommandList&& commands) const noexcept
         owned->recording = false;
     }
 
-    const VkFenceCreateInfo fence_info{
-        .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
+    assert(owned->frame && owned->frame->active);
+    if (!owned->frame || !owned->frame->active)
+        return Error::driver_error;
+    assert(impl_->next_signal != 0 && "timeline submission counter overflow");
+    if (impl_->next_signal == 0)
+        return Error::driver_error;
+    const auto signal_value = impl_->next_signal;
+    const VkCommandBufferSubmitInfo command_info{
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO,
+        .pNext = nullptr,
+        .commandBuffer = owned->command_buffer,
+        .deviceMask = 1,
+    };
+    const VkSemaphoreSubmitInfo signal_info{
+        .sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
+        .pNext = nullptr,
+        .semaphore = impl_->timeline,
+        .value = signal_value,
+        .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+        .deviceIndex = 0,
+    };
+    const VkSubmitInfo2 submit_info{
+        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2,
         .pNext = nullptr,
         .flags = 0,
+        .waitSemaphoreInfoCount = 0,
+        .pWaitSemaphoreInfos = nullptr,
+        .commandBufferInfoCount = 1,
+        .pCommandBufferInfos = &command_info,
+        .signalSemaphoreInfoCount = 1,
+        .pSignalSemaphoreInfos = &signal_info,
     };
-    VkFence fence = VK_NULL_HANDLE;
-    auto error = error_from_vk(vkCreateFence(impl_->device, &fence_info, nullptr, &fence));
+    const auto error = error_from_vk(
+        vkQueueSubmit2(impl_->queue, 1, &submit_info, VK_NULL_HANDLE));
     if (error != Error::none)
         return error;
-    const VkSubmitInfo submit_info{
-        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+
+    for (auto* initialization : owned->pending_texture_initializations)
+    {
+        assert(initialization && !initialization->initialized);
+        assert(initialization->owner == &owned->pending_texture_initializations);
+        initialization->initialized = true;
+        initialization->owner = nullptr;
+    }
+    owned->pending_texture_initializations.clear();
+    owned->frame->last_signal = signal_value;
+    owned->frame->active = false;
+    owned->frame = nullptr;
+    impl_->last_submitted_signal = signal_value;
+    ++impl_->next_signal;
+    ++impl_->next_frame;
+    return Error::none;
+}
+
+Error Device::submit_and_wait(CommandList&& commands) const noexcept
+{
+    const auto error = submit(std::move(commands));
+    if (error != Error::none)
+        return error;
+    const auto value = impl_->last_submitted_signal;
+    const VkSemaphoreWaitInfo wait_info{
+        .sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO,
         .pNext = nullptr,
-        .waitSemaphoreCount = 0,
-        .pWaitSemaphores = nullptr,
-        .pWaitDstStageMask = nullptr,
-        .commandBufferCount = 1,
-        .pCommandBuffers = &owned->command_buffer,
-        .signalSemaphoreCount = 0,
-        .pSignalSemaphores = nullptr,
+        .flags = 0,
+        .semaphoreCount = 1,
+        .pSemaphores = &impl_->timeline,
+        .pValues = &value,
     };
+    const auto wait_error = error_from_vk(vkWaitSemaphores(
+        impl_->device,
+        &wait_info,
+        std::numeric_limits<std::uint64_t>::max()));
+    if (wait_error == Error::none)
     {
-        const std::scoped_lock lock(impl_->queue_mutex);
-        error = error_from_vk(vkQueueSubmit(impl_->queue, 1, &submit_info, fence));
+        for (auto& frame : impl_->frames)
+        {
+            if (frame.last_signal != 0 && frame.last_signal <= value)
+            {
+                assert(!frame.active);
+                frame.last_signal = 0;
+                const auto reset_error = impl_->reset_frame_commands(frame);
+                if (reset_error != Error::none)
+                    return reset_error;
+            }
+        }
     }
-    if (error == Error::none)
-    {
-        error = error_from_vk(vkWaitForFences(
-            impl_->device, 1, &fence, VK_TRUE, std::numeric_limits<std::uint64_t>::max()));
-    }
-    if (fence)
-        vkDestroyFence(impl_->device, fence, nullptr);
-    return error;
+    return wait_error;
 }
 
 Error Device::wait_idle() const noexcept
@@ -2537,8 +2815,24 @@ Error Device::wait_idle() const noexcept
     assert(impl_ && "wait_idle called on an empty device");
     if (!impl_)
         return Error::driver_error;
-    const std::scoped_lock lock(impl_->queue_mutex);
-    return error_from_vk(vkDeviceWaitIdle(impl_->device));
+    const bool commands_recording = std::ranges::any_of(
+        impl_->frames, [](const detail::FrameContext& frame) { return frame.active; });
+    assert(!commands_recording &&
+           "wait_idle is not allowed while a command list is recording");
+    if (commands_recording)
+        return Error::driver_error;
+    const auto error = error_from_vk(vkDeviceWaitIdle(impl_->device));
+    if (error == Error::none)
+    {
+        for (auto& frame : impl_->frames)
+        {
+            frame.last_signal = 0;
+            const auto reset_error = impl_->reset_frame_commands(frame);
+            if (reset_error != Error::none)
+                return reset_error;
+        }
+    }
+    return error;
 }
 
 const DeviceCaps& Device::caps() const noexcept
@@ -2553,45 +2847,47 @@ void CommandList::bind_pipeline(const Pipeline& pipeline) noexcept
     assert(valid && "bind_pipeline received an empty command list or pipeline");
     if (!valid)
         return;
-    const bool same_device = pipeline.impl_->state.get() == impl_->state.get();
+    const bool same_device = pipeline.impl_->state == impl_->state;
     assert(same_device && "pipeline belongs to a different device");
     if (!same_device)
         return;
     vkCmdBindPipeline(
         impl_->command_buffer, pipeline.impl_->bind_point, pipeline.impl_->pipeline);
-    impl_->retained_resources.emplace_back(pipeline.impl_);
     if (pipeline.impl_->bind_point == VK_PIPELINE_BIND_POINT_GRAPHICS)
-        impl_->bound_graphics = pipeline.impl_;
+        impl_->bound_graphics = pipeline.impl_.get();
     else
-        impl_->bound_compute = pipeline.impl_;
+        impl_->bound_compute = pipeline.impl_.get();
 }
 
-CommandList::AddressRange CommandList::validate_and_retain(
-    GpuRange range) noexcept
+CommandList::AddressRange CommandList::validate_range(GpuRange range) noexcept
 {
     const bool valid = impl_ && impl_->recording;
     assert(valid && "address commands require a recording command list");
     if (!valid)
         return {};
-    auto resolved = impl_->state->resolve_gpu_address(range);
-    assert(resolved.allocation);
-    if (!resolved.allocation)
+    const bool nonempty = range.gpu_ptr && range.size != 0;
+    assert(nonempty && "GPU range must have a non-null pointer and non-zero size");
+    if (!nonempty)
         return {};
-    impl_->retained_resources.emplace_back(resolved.allocation);
+    const auto address = static_cast<VkDeviceAddress>(
+        reinterpret_cast<std::uintptr_t>(range.gpu_ptr));
+    const bool address_fits =
+        address <= std::numeric_limits<VkDeviceAddress>::max() - range.size;
+    assert(address_fits && "GPU range address overflow");
+    if (!address_fits)
+        return {};
     return {
-        .address = resolved.address,
-        .size = resolved.size,
-        .allocation = std::move(resolved.allocation),
+        .address = address,
+        .size = range.size,
     };
 }
 
-void CommandList::retain(Texture& texture) noexcept
+void CommandList::validate_texture(Texture& texture) noexcept
 {
-    const bool valid = texture.impl_ && texture.impl_->state.get() == impl_->state.get();
+    const bool valid = texture.impl_ && texture.impl_->state == impl_->state;
     assert(valid && "texture is empty or belongs to a different device");
     if (!valid)
         return;
-    impl_->retained_resources.emplace_back(texture.impl_);
 }
 
 bool CommandList::require_graphics_pipeline() const noexcept
@@ -2615,34 +2911,73 @@ bool CommandList::require_compute_pipeline() const noexcept
     return impl_->bound_compute != nullptr;
 }
 
-void CommandList::push_data(std::span<const std::byte> bytes, std::uint32_t offset) noexcept
+bool CommandList::emit_root_data(const void* data, std::size_t size) noexcept
 {
-    const bool recording = impl_ && impl_->recording;
-    assert(recording && "push_data requires a recording command list");
-    if (!recording)
-        return;
-    if (bytes.empty())
-        return;
-    const bool aligned = (offset & 3u) == 0 && (bytes.size() & 3u) == 0;
-    assert(aligned && "vkCmdPushDataEXT offset and size must be multiples of four bytes");
-    const bool fits = bytes.size() <= std::numeric_limits<std::uint32_t>::max() &&
-                      offset <= impl_->state->caps.max_push_data_size &&
-                      bytes.size() <= impl_->state->caps.max_push_data_size - offset;
-    assert(fits &&
-           "root data exceeds VkPhysicalDeviceDescriptorHeapPropertiesEXT::maxPushDataSize");
-    if (!aligned || !fits)
-        return;
-
+    const bool has_data = data != nullptr;
+    const bool valid = has_data == (size != 0) &&
+                       (!has_data || ((size & 3u) == 0 &&
+                                      size <= impl_->state->heap_properties.maxPushDataSize));
+    assert(valid &&
+           "draw/dispatch root data must be null with zero size or non-null, "
+           "four-byte sized, and fit "
+           "VkPhysicalDeviceDescriptorHeapPropertiesEXT::maxPushDataSize");
+    if (!valid)
+        return false;
+    if (!has_data)
+        return true;
     const VkPushDataInfoEXT info{
         .sType = VK_STRUCTURE_TYPE_PUSH_DATA_INFO_EXT,
         .pNext = nullptr,
-        .offset = offset,
+        .offset = 0,
         .data = {
-            .address = bytes.data(),
-            .size = bytes.size(),
+            .address = data,
+            .size = size,
         },
     };
     impl_->state->fn.cmd_push_data(impl_->command_buffer, &info);
+    return true;
+}
+
+void CommandList::set_resource_heap(GpuRange heap) noexcept
+{
+    const bool valid = impl_ && impl_->recording;
+    assert(valid && "set_resource_heap requires a recording command list");
+    if (!valid)
+        return;
+    const auto& properties = impl_->state->heap_properties;
+    VkBindHeapInfoEXT bind_info{};
+    if (!make_heap_bind_info(
+            heap,
+            properties.resourceHeapAlignment,
+            std::max(properties.imageDescriptorAlignment,
+                     properties.bufferDescriptorAlignment),
+            properties.minResourceHeapReservedRange,
+            properties.maxResourceHeapSize,
+            bind_info))
+    {
+        return;
+    }
+    impl_->state->fn.cmd_bind_resource_heap(impl_->command_buffer, &bind_info);
+}
+
+void CommandList::set_sampler_heap(GpuRange heap) noexcept
+{
+    const bool valid = impl_ && impl_->recording;
+    assert(valid && "set_sampler_heap requires a recording command list");
+    if (!valid)
+        return;
+    const auto& properties = impl_->state->heap_properties;
+    VkBindHeapInfoEXT bind_info{};
+    if (!make_heap_bind_info(heap,
+                             properties.samplerHeapAlignment,
+                             properties.samplerDescriptorAlignment,
+                             properties.minSamplerHeapReservedRange,
+                             properties.maxSamplerHeapSize,
+                             bind_info))
+    {
+        return;
+    }
+    impl_->state->fn.cmd_bind_sampler_heap(impl_->command_buffer, &bind_info);
 }
 
 void CommandList::begin_rendering(Texture& color,
@@ -2656,7 +2991,7 @@ void CommandList::begin_rendering(Texture& color,
     if (!valid)
         return;
     assert(!impl_->rendering && "a rendering scope is already active");
-    const bool valid_color = color.impl_->state.get() == impl_->state.get() &&
+    const bool valid_color = color.impl_->state == impl_->state &&
                              has_flag(color.impl_->desc.usage,
                                       TextureUsage::color_attachment);
     assert(valid_color &&
@@ -2665,8 +3000,7 @@ void CommandList::begin_rendering(Texture& color,
         return;
     if (depth)
     {
-        const bool valid_depth = depth->impl_ &&
-                                 depth->impl_->state.get() == impl_->state.get();
+        const bool valid_depth = depth->impl_ && depth->impl_->state == impl_->state;
         assert(valid_depth && "depth target is empty or belongs to a different device");
         if (!valid_depth)
             return;
@@ -2688,9 +3022,24 @@ void CommandList::begin_rendering(Texture& color,
     if (!valid_clear_depth)
         return;
 
-    retain(color);
+    initialize_texture(*impl_,
+                       *color.impl_,
+                       VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                       VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT |
+                           VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
     if (depth)
-        retain(*depth);
+    {
+        initialize_texture(*impl_,
+                           *depth->impl_,
+                           VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
+                               VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
+                           VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
+                               VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT);
+    }
+
+    validate_texture(color);
+    if (depth)
+        validate_texture(*depth);
 
     const VkRenderingAttachmentInfo attachment{
         .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
@@ -2759,16 +3108,20 @@ void CommandList::end_rendering() noexcept
     impl_->rendering_has_depth = false;
 }
 
-void CommandList::draw(std::uint32_t vertex_count,
-                       std::uint32_t instance_count,
-                       std::uint32_t first_vertex,
-                       std::uint32_t first_instance) noexcept
+void CommandList::draw_impl(const void* root,
+                            std::size_t root_size,
+                            std::uint32_t vertex_count,
+                            std::uint32_t instance_count,
+                            std::uint32_t first_vertex,
+                            std::uint32_t first_instance) noexcept
 {
     const bool valid = impl_ && impl_->recording && impl_->rendering;
     assert(valid && "draw requires an active rendering scope");
     if (!valid)
         return;
     if (!require_graphics_pipeline())
+        return;
+    if (!emit_root_data(root, root_size))
         return;
     vkCmdDraw(impl_->command_buffer,
               vertex_count,
@@ -2777,13 +3130,15 @@ void CommandList::draw(std::uint32_t vertex_count,
               first_instance);
 }
 
-void CommandList::draw_indexed(GpuRange indices,
-                               IndexType type,
-                               std::uint32_t index_count,
-                               std::uint32_t instance_count,
-                               std::uint32_t first_index,
-                               std::int32_t vertex_offset,
-                               std::uint32_t first_instance) noexcept
+void CommandList::draw_indexed_impl(const void* root,
+                                    std::size_t root_size,
+                                    GpuRange indices,
+                                    IndexType type,
+                                    std::uint32_t index_count,
+                                    std::uint32_t instance_count,
+                                    std::uint32_t first_index,
+                                    std::int32_t vertex_offset,
+                                    std::uint32_t first_instance) noexcept
 {
     const bool valid = impl_ && impl_->recording && impl_->rendering;
     assert(valid && "draw_indexed requires an active rendering scope");
@@ -2795,7 +3150,7 @@ void CommandList::draw_indexed(GpuRange indices,
         return;
     if (!require_graphics_pipeline())
         return;
-    const auto range = validate_and_retain(indices);
+    const auto range = validate_range(indices);
     const auto alignment = type == IndexType::uint16 ? 2u : 4u;
     assert(range.address % alignment == 0 &&
            "index address range is empty or misaligned");
@@ -2816,6 +3171,8 @@ void CommandList::draw_indexed(GpuRange indices,
         .indexType = type == IndexType::uint16 ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32,
     };
     impl_->state->fn.cmd_bind_index_buffer(impl_->command_buffer, &bind_info);
+    if (!emit_root_data(root, root_size))
+        return;
     vkCmdDrawIndexed(impl_->command_buffer,
                      index_count,
                      instance_count,
@@ -2824,9 +3181,11 @@ void CommandList::draw_indexed(GpuRange indices,
                      first_instance);
 }
 
-void CommandList::draw_indirect(GpuRange arguments,
-                                std::uint32_t draw_count,
-                                std::uint32_t stride) noexcept
+void CommandList::draw_indirect_impl(const void* root,
+                                     std::size_t root_size,
+                                     GpuRange arguments,
+                                     std::uint32_t draw_count,
+                                     std::uint32_t stride) noexcept
 {
     const bool valid = impl_ && impl_->recording && impl_->rendering;
     assert(valid && "draw_indirect requires an active rendering scope");
@@ -2847,7 +3206,7 @@ void CommandList::draw_indirect(GpuRange arguments,
     assert(valid_arguments && "indirect draw range, count, or stride is invalid");
     if (!valid_arguments)
         return;
-    const auto range = validate_and_retain(arguments);
+    const auto range = validate_range(arguments);
     const bool range_fits = (range.address & 3u) == 0 &&
                             range.size >= required_size && stride <= range.size;
     assert(range_fits && "indirect draw range, count, or stride is invalid");
@@ -2860,14 +3219,18 @@ void CommandList::draw_indirect(GpuRange arguments,
         .addressFlags = address_flags,
         .drawCount = draw_count,
     };
+    if (!emit_root_data(root, root_size))
+        return;
     impl_->state->fn.cmd_draw_indirect(impl_->command_buffer, &info);
 }
 
-void CommandList::draw_indexed_indirect(GpuRange indices,
-                                        IndexType type,
-                                        GpuRange arguments,
-                                        std::uint32_t draw_count,
-                                        std::uint32_t stride) noexcept
+void CommandList::draw_indexed_indirect_impl(const void* root,
+                                             std::size_t root_size,
+                                             GpuRange indices,
+                                             IndexType type,
+                                             GpuRange arguments,
+                                             std::uint32_t draw_count,
+                                             std::uint32_t stride) noexcept
 {
     const bool valid = impl_ && impl_->recording && impl_->rendering;
     assert(valid && "draw_indexed_indirect requires an active rendering scope");
@@ -2879,7 +3242,7 @@ void CommandList::draw_indexed_indirect(GpuRange indices,
         return;
     if (!require_graphics_pipeline())
         return;
-    const auto index_range = validate_and_retain(indices);
+    const auto index_range = validate_range(indices);
     const auto index_alignment = type == IndexType::uint16 ? 2u : 4u;
     const bool valid_index_range = index_range.address % index_alignment == 0;
     assert(valid_index_range && "index address range is empty or misaligned");
@@ -2899,7 +3262,7 @@ void CommandList::draw_indexed_indirect(GpuRange indices,
            "indexed indirect draw range, count, or stride is invalid");
     if (!valid_arguments)
         return;
-    const auto argument_range = validate_and_retain(arguments);
+    const auto argument_range = validate_range(arguments);
     const bool range_fits = (argument_range.address & 3u) == 0 &&
                             argument_range.size >= required_size &&
                             stride <= argument_range.size;
@@ -2922,10 +3285,16 @@ void CommandList::draw_indexed_indirect(GpuRange indices,
         .addressFlags = address_flags,
         .drawCount = draw_count,
     };
+    if (!emit_root_data(root, root_size))
+        return;
     impl_->state->fn.cmd_draw_indexed_indirect(impl_->command_buffer, &info);
 }
 
-void CommandList::dispatch(std::uint32_t x, std::uint32_t y, std::uint32_t z) noexcept
+void CommandList::dispatch_impl(const void* root,
+                                std::size_t root_size,
+                                std::uint32_t x,
+                                std::uint32_t y,
+                                std::uint32_t z) noexcept
 {
     const bool valid = impl_ && impl_->recording && !impl_->rendering;
     assert(valid && "dispatch requires a recording command list outside rendering");
@@ -2939,10 +3308,14 @@ void CommandList::dispatch(std::uint32_t x, std::uint32_t y, std::uint32_t z) no
            "dispatch group count exceeds VkPhysicalDeviceLimits::maxComputeWorkGroupCount");
     if (!count_fits)
         return;
+    if (!emit_root_data(root, root_size))
+        return;
     vkCmdDispatch(impl_->command_buffer, x, y, z);
 }
 
-void CommandList::dispatch_indirect(GpuRange arguments) noexcept
+void CommandList::dispatch_indirect_impl(const void* root,
+                                         std::size_t root_size,
+                                         GpuRange arguments) noexcept
 {
     const bool valid = impl_ && impl_->recording && !impl_->rendering;
     assert(valid &&
@@ -2951,7 +3324,7 @@ void CommandList::dispatch_indirect(GpuRange arguments) noexcept
         return;
     if (!require_compute_pipeline())
         return;
-    const auto range = validate_and_retain(arguments);
+    const auto range = validate_range(arguments);
     const bool range_fits = (range.address & 3u) == 0 &&
                             range.size >= sizeof(VkDispatchIndirectCommand);
     assert(range_fits && "indirect dispatch range is too small or misaligned");
@@ -2963,6 +3336,8 @@ void CommandList::dispatch_indirect(GpuRange arguments) noexcept
         .addressRange = {range.address, range.size},
         .addressFlags = address_flags,
     };
+    if (!emit_root_data(root, root_size))
+        return;
     impl_->state->fn.cmd_dispatch_indirect(impl_->command_buffer, &info);
 }
 
@@ -2972,8 +3347,8 @@ void CommandList::copy_memory(GpuRange source, GpuRange destination) noexcept
     assert(valid && "copy_memory requires a recording command list outside rendering");
     if (!valid)
         return;
-    const auto source_range = validate_and_retain(source);
-    const auto destination_range = validate_and_retain(destination);
+    const auto source_range = validate_range(source);
+    const auto destination_range = validate_range(destination);
     const bool destination_fits = destination_range.size >= source_range.size;
     assert(destination_fits &&
            "copy_memory destination range is smaller than its source range");
@@ -3008,23 +3383,28 @@ void CommandList::copy_memory_to_texture(GpuRange source, Texture& destination) 
            "copy_memory_to_texture received an empty object or active rendering scope");
     if (!valid)
         return;
-    const bool valid_texture = destination.impl_->state.get() == impl_->state.get() &&
+    const bool valid_texture = destination.impl_->state == impl_->state &&
                                has_flag(destination.impl_->desc.usage,
                                         TextureUsage::transfer_destination);
     assert(valid_texture &&
            "texture must belong to the device and support transfer destination use");
     if (!valid_texture)
         return;
-    retain(destination);
+    validate_texture(destination);
     const auto texel_size = bytes_per_texel(destination.impl_->desc.format);
     const auto required_size = base_level_byte_size(destination.impl_->desc);
-    const auto source_range = validate_and_retain(source);
+    const auto source_range = validate_range(source);
     const bool range_fits = source_range.address % texel_size == 0 &&
                             source_range.size >= required_size;
     assert(range_fits &&
            "source range is empty, misaligned, or too small for the texture base level");
     if (!range_fits)
         return;
+
+    initialize_texture(*impl_,
+                       *destination.impl_,
+                       VK_PIPELINE_STAGE_2_COPY_BIT,
+                       VK_ACCESS_2_TRANSFER_WRITE_BIT);
 
     const bool depth = destination.impl_->desc.format == Format::d32_float;
     const VkDeviceMemoryImageCopyKHR region{
@@ -3064,23 +3444,28 @@ void CommandList::copy_texture_to_memory(Texture& source, GpuRange destination) 
            "copy_texture_to_memory received an empty object or active rendering scope");
     if (!valid)
         return;
-    const bool valid_texture = source.impl_->state.get() == impl_->state.get() &&
+    const bool valid_texture = source.impl_->state == impl_->state &&
                                has_flag(source.impl_->desc.usage,
                                         TextureUsage::transfer_source);
     assert(valid_texture &&
            "texture must belong to the device and support transfer source use");
     if (!valid_texture)
         return;
-    retain(source);
+    validate_texture(source);
     const auto texel_size = bytes_per_texel(source.impl_->desc.format);
     const auto required_size = base_level_byte_size(source.impl_->desc);
-    const auto destination_range = validate_and_retain(destination);
+    const auto destination_range = validate_range(destination);
     const bool range_fits = destination_range.address % texel_size == 0 &&
                             destination_range.size >= required_size;
     assert(range_fits &&
            "destination range is empty, misaligned, or too small for the texture base level");
     if (!range_fits)
         return;
+
+    initialize_texture(*impl_,
+                       *source.impl_,
+                       VK_PIPELINE_STAGE_2_COPY_BIT,
+                       VK_ACCESS_2_TRANSFER_READ_BIT);
 
     const bool depth = source.impl_->desc.format == Format::d32_float;
     const VkDeviceMemoryImageCopyKHR region{
@@ -3158,7 +3543,7 @@ Error CommandList::finish() noexcept
     const auto error = error_from_vk(vkEndCommandBuffer(impl_->command_buffer));
     if (error != Error::none)
     {
-        impl_.reset();
+        std::destroy_at(std::exchange(impl_, nullptr));
         return error;
     }
     impl_->recording = false;
@@ -3169,25 +3554,7 @@ Texture::Texture() noexcept = default;
 Texture::~Texture() = default;
 Texture::Texture(Texture&&) noexcept = default;
 Texture& Texture::operator=(Texture&&) noexcept = default;
-Texture::Texture(std::shared_ptr<Impl> impl) noexcept : impl_(std::move(impl)) {}
-
-std::uint32_t Texture::sampled_index() const noexcept
-{
-    const bool valid = impl_ && impl_->sampled_index != invalid_heap_index;
-    assert(valid && "texture has no sampled descriptor");
-    if (!valid)
-        return invalid_heap_index;
-    return impl_->sampled_index;
-}
-
-std::uint32_t Texture::storage_index() const noexcept
-{
-    const bool valid = impl_ && impl_->storage_index != invalid_heap_index;
-    assert(valid && "texture has no storage descriptor");
-    if (!valid)
-        return invalid_heap_index;
-    return impl_->storage_index;
-}
+Texture::Texture(std::unique_ptr<Impl> impl) noexcept : impl_(std::move(impl)) {}
 
 std::uint32_t Texture::width() const noexcept
 {
@@ -3202,41 +3569,39 @@ std::uint32_t Texture::height() const noexcept
 }
 Texture::operator bool() const noexcept { return impl_ != nullptr; }
 
-Sampler::Sampler() noexcept = default;
-Sampler::~Sampler() = default;
-Sampler::Sampler(Sampler&&) noexcept = default;
-Sampler& Sampler::operator=(Sampler&&) noexcept = default;
-Sampler::Sampler(std::unique_ptr<Impl> impl) noexcept : impl_(std::move(impl)) {}
-
-std::uint32_t Sampler::index() const noexcept
-{
-    assert(impl_ && "index called on an empty sampler");
-    if (!impl_)
-        return invalid_heap_index;
-    return impl_->index;
-}
-
-Sampler::operator bool() const noexcept { return impl_ != nullptr; }
-
 Pipeline::Pipeline() noexcept = default;
 Pipeline::~Pipeline() = default;
 Pipeline::Pipeline(Pipeline&&) noexcept = default;
 Pipeline& Pipeline::operator=(Pipeline&&) noexcept = default;
-Pipeline::Pipeline(std::shared_ptr<Impl> impl) noexcept : impl_(std::move(impl)) {}
+Pipeline::Pipeline(std::unique_ptr<Impl> impl) noexcept : impl_(std::move(impl)) {}
 Pipeline::operator bool() const noexcept { return impl_ != nullptr; }
 
 CommandList::CommandList() noexcept = default;
-CommandList::~CommandList() = default;
-CommandList::CommandList(CommandList&&) noexcept = default;
-CommandList& CommandList::operator=(CommandList&&) noexcept = default;
-CommandList::CommandList(std::unique_ptr<Impl> impl) noexcept : impl_(std::move(impl)) {}
+CommandList::~CommandList()
+{
+    if (impl_)
+        std::destroy_at(std::exchange(impl_, nullptr));
+}
+CommandList::CommandList(CommandList&& other) noexcept
+    : impl_(std::exchange(other.impl_, nullptr))
+{}
+CommandList& CommandList::operator=(CommandList&& other) noexcept
+{
+    if (this == &other)
+        return *this;
+    if (impl_)
+        std::destroy_at(impl_);
+    impl_ = std::exchange(other.impl_, nullptr);
+    return *this;
+}
+CommandList::CommandList(Impl* impl) noexcept : impl_(impl) {}
 CommandList::operator bool() const noexcept { return impl_ != nullptr; }
 
 Device::Device() noexcept = default;
 Device::~Device() = default;
 Device::Device(Device&&) noexcept = default;
 Device& Device::operator=(Device&&) noexcept = default;
-Device::Device(std::shared_ptr<detail::DeviceState> impl) noexcept : impl_(std::move(impl)) {}
+Device::Device(std::unique_ptr<detail::DeviceState> impl) noexcept : impl_(std::move(impl)) {}
 Device::operator bool() const noexcept { return impl_ != nullptr; }
 
 } // namespace gfx

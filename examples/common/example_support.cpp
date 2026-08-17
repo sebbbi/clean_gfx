@@ -21,7 +21,6 @@ const char* gfx_error_name(gfx::Error error) noexcept
     case gfx::Error::none: return "none";
     case gfx::Error::unsupported: return "unsupported";
     case gfx::Error::out_of_device_memory: return "out of device memory";
-    case gfx::Error::out_of_descriptors: return "out of descriptors";
     case gfx::Error::invalid_shader: return "invalid shader";
     case gfx::Error::device_lost: return "device lost";
     case gfx::Error::driver_error: return "driver error";

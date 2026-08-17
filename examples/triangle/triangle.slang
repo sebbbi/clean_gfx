@@ -1,7 +1,14 @@
-#include "triangle_shared.h"
+static const float3 positions[3] = {
+    float3(0.5f, -0.5f, 0.5f),
+    float3(0.5f, 0.5f, 0.5f),
+    float3(-0.5f, 0.5f, 0.5f),
+};
 
-[[vk::push_constant]]
-ConstantBuffer<RootArguments> root;
+static const float3 colors[3] = {
+    float3(1.0f, 0.0f, 0.0f),
+    float3(0.0f, 1.0f, 0.0f),
+    float3(0.0f, 0.0f, 1.0f),
+};
 
 struct VertexOutput
 {
@@ -12,10 +19,9 @@ struct VertexOutput
 [shader("vertex")]
 VertexOutput vertexMain(uint vertex_id : SV_VertexID)
 {
-    Vertex vertex = root.vertices[vertex_id];
     VertexOutput output;
-    output.position = float4(vertex.position, 1.0f);
-    output.color = vertex.color;
+    output.position = float4(positions[vertex_id], 1.0f);
+    output.color = colors[vertex_id];
     return output;
 }
 

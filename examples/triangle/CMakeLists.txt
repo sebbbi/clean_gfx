@@ -1,5 +1,5 @@
-find_program(CLEAN_GFX_SLANGC NAMES slangc REQUIRED)
-find_program(CLEAN_GFX_SPIRV_VAL NAMES spirv-val)
+include(${CMAKE_CURRENT_LIST_DIR}/../clean_gfx_slang.cmake)
+clean_gfx_find_shader_tools()
 
 set(CLEAN_GFX_SHADER_SOURCE ${CMAKE_CURRENT_SOURCE_DIR}/triangle.slang)
 set(CLEAN_GFX_SHADER_OUTPUT_DIR ${CMAKE_CURRENT_BINARY_DIR}/shaders)
@@ -7,11 +7,6 @@ set(CLEAN_GFX_VERTEX_SPV ${CLEAN_GFX_SHADER_OUTPUT_DIR}/triangle.vert.spv)
 set(CLEAN_GFX_FRAGMENT_SPV ${CLEAN_GFX_SHADER_OUTPUT_DIR}/triangle.frag.spv)
 
 function(clean_gfx_compile_slang output entry stage)
-    set(validate_command)
-    if(CLEAN_GFX_SPIRV_VAL)
-        set(validate_command COMMAND ${CLEAN_GFX_SPIRV_VAL}
-            --target-env vulkan1.4 --scalar-block-layout ${output})
-    endif()
     add_custom_command(
         OUTPUT ${output}
         COMMAND ${CMAKE_COMMAND} -E make_directory ${CLEAN_GFX_SHADER_OUTPUT_DIR}
@@ -21,17 +16,13 @@ function(clean_gfx_compile_slang output entry stage)
             -profile spirv_1_6
             -emit-spirv-directly
             -fvk-use-entrypoint-name
-            -fvk-use-c-layout
-            -I ${CMAKE_CURRENT_SOURCE_DIR}
-            -I ${PROJECT_SOURCE_DIR}/include
             -entry ${entry}
             -stage ${stage}
             -o ${output}
-        ${validate_command}
+        COMMAND ${CLEAN_GFX_SPIRV_VAL}
+            --target-env vulkan1.4 --scalar-block-layout ${output}
         DEPENDS
             ${CLEAN_GFX_SHADER_SOURCE}
-            ${CMAKE_CURRENT_SOURCE_DIR}/triangle_shared.h
-            ${PROJECT_SOURCE_DIR}/include/clean_gfx/shader_types.h
         VERBATIM
         COMMENT "Compiling Slang ${stage} shader ${entry}"
     )
@@ -42,10 +33,18 @@ clean_gfx_compile_slang(${CLEAN_GFX_FRAGMENT_SPV} fragmentMain fragment)
 
 add_executable(clean_gfx_triangle
     triangle.cpp
+    ${CLEAN_GFX_SHADER_SOURCE}
     ../common/example_support.cpp
+    ../common/example_support.hpp
     ${CLEAN_GFX_VERTEX_SPV}
     ${CLEAN_GFX_FRAGMENT_SPV}
 )
+set_source_files_properties(${CLEAN_GFX_SHADER_SOURCE}
+    PROPERTIES HEADER_FILE_ONLY TRUE)
+source_group("Shaders" FILES ${CLEAN_GFX_SHADER_SOURCE})
+source_group("Common" FILES
+    ../common/example_support.cpp
+    ../common/example_support.hpp)
 clean_gfx_disable_exceptions(clean_gfx_triangle)
 target_link_libraries(clean_gfx_triangle PRIVATE clean_gfx::clean_gfx)
 target_include_directories(clean_gfx_triangle PRIVATE

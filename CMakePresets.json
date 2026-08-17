@@ -15,8 +15,7 @@
       "binaryDir": "${sourceDir}/build-msvc",
       "cacheVariables": {
         "CLEAN_GFX_BUILD_EXAMPLES": true,
-        "CLEAN_GFX_BUILD_TESTS": true,
-        "CLEAN_GFX_FETCH_VULKAN_HEADERS": false
+        "CLEAN_GFX_BUILD_TESTS": true
       }
     }
   ],

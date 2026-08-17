@@ -188,15 +188,15 @@ Matrix look_at(float3 eye, float3 center, float3 up) noexcept
     return result;
 }
 
-void copy_matrix(float4 (&destination)[4], const Matrix& source) noexcept
+void copy_matrix(float4x4& destination, const Matrix& source) noexcept
 {
-    for (std::uint32_t column = 0; column != 4; ++column)
+    for (std::uint32_t row = 0; row != 4; ++row)
     {
-        destination[column] = {
-            source.element[column][0],
-            source.element[column][1],
-            source.element[column][2],
-            source.element[column][3],
+        destination.rows[row] = {
+            source.element[0][row],
+            source.element[1][row],
+            source.element[2][row],
+            source.element[3][row],
         };
     }
 }
@@ -387,6 +387,8 @@ bool render_frame(const gfx::Device& device,
                   const gfx::Pipeline& pipeline,
                   gfx::Texture& target,
                   gfx::Texture& depth,
+                  gfx::GpuRange resource_heap,
+                  gfx::GpuRange sampler_heap,
                   const CubeRootArguments& root,
                   gfx::GpuAllocation readback) noexcept
 {
@@ -399,10 +401,11 @@ bool render_frame(const gfx::Device& device,
                      gfx::Access::transfer_read | gfx::Access::depth_write,
                      gfx::Stage::color_output | gfx::Stage::depth_tests,
                      gfx::Access::color_write | gfx::Access::depth_write);
+    commands.set_resource_heap(resource_heap);
+    commands.set_sampler_heap(sampler_heap);
     commands.begin_rendering(target, {0.2f, 0.2f, 0.2f, 0.2f}, true, &depth, 1.0f);
     commands.bind_pipeline(pipeline);
-    commands.push_root(root);
-    commands.draw(static_cast<std::uint32_t>(cube_vertices.size()));
+    commands.draw(&root, static_cast<std::uint32_t>(cube_vertices.size()));
     commands.end_rendering();
     commands.barrier(gfx::Stage::color_output,
                      gfx::Access::color_write,
@@ -438,6 +441,13 @@ int main(int argc, char** argv)
         return 1;
     std::cout << "Using " << device.caps().device_name << '\n';
 
+    const auto resource_heap_size = device.caps().image_descriptor_size;
+    const auto sampler_heap_size =
+        device.caps().sampler_descriptor_size *
+        static_cast<std::uint32_t>(CubeSampler::count);
+    auto resource_heap = device.gpu_malloc_resource_heap(resource_heap_size);
+    auto sampler_heap = device.gpu_malloc_sampler_heap(sampler_heap_size);
+
     auto vertex_memory = device.gpu_malloc<CubeVertex>(cube_vertices.size());
     std::memcpy(vertex_memory.cpu_ptr, cube_vertices.data(), sizeof(cube_vertices));
 
@@ -467,19 +477,44 @@ int main(int argc, char** argv)
             application_name, "create cube texture"))
         return 1;
 
-    gfx::Sampler sampler;
     if (!gfx_succeeded(
-            device.create_sampler(
-                sampler,
-                {
-                    .min_filter = gfx::Filter::nearest,
-                    .mag_filter = gfx::Filter::nearest,
-                    .address_u = gfx::AddressMode::clamp_to_edge,
-                    .address_v = gfx::AddressMode::clamp_to_edge,
-                    .address_w = gfx::AddressMode::clamp_to_edge,
-                }),
-            application_name, "create sampler"))
+            device.write_texture_descriptor(
+                resource_heap.cpu_ptr,
+                texture,
+                gfx::TextureDescriptorType::sampled),
+            application_name, "write cube texture descriptor"))
         return 1;
+
+    const std::array<gfx::SamplerDesc,
+                     static_cast<std::size_t>(CubeSampler::count)> sampler_descs{{
+        {},
+        {
+            .min_filter = gfx::Filter::nearest,
+            .mag_filter = gfx::Filter::nearest,
+        },
+        {
+            .address_u = gfx::AddressMode::clamp_to_edge,
+            .address_v = gfx::AddressMode::clamp_to_edge,
+            .address_w = gfx::AddressMode::clamp_to_edge,
+        },
+        {
+            .min_filter = gfx::Filter::nearest,
+            .mag_filter = gfx::Filter::nearest,
+            .address_u = gfx::AddressMode::clamp_to_edge,
+            .address_v = gfx::AddressMode::clamp_to_edge,
+            .address_w = gfx::AddressMode::clamp_to_edge,
+        },
+    }};
+    auto* sampler_descriptors = static_cast<std::byte*>(sampler_heap.cpu_ptr);
+    for (std::size_t index = 0; index < sampler_descs.size(); ++index)
+    {
+        if (!gfx_succeeded(
+                device.write_sampler_descriptor(
+                    sampler_descriptors + index * device.caps().sampler_descriptor_size,
+                    sampler_descs[index]),
+                application_name, "write cube sampler descriptor"))
+            return 1;
+    }
 
     gfx::Texture target;
     if (!gfx_succeeded(
@@ -584,15 +619,22 @@ int main(int argc, char** argv)
         ++frame_index;
         CubeRootArguments root{
             .vertices = static_cast<CubeVertex*>(vertex_memory.gpu_ptr),
-            .texture_index = texture.sampled_index(),
-            .sampler_index = sampler.index(),
+            .texture_index = 0,
         };
         const Matrix model = rotation_y(
             radians_per_frame * static_cast<float>(frame_index));
         const Matrix mvp = multiply(projection, multiply(view, model));
         copy_matrix(root.mvp, mvp);
 
-        succeeded = render_frame(device, pipeline, target, depth, root, readback);
+        succeeded = render_frame(
+            device,
+            pipeline,
+            target,
+            depth,
+            {resource_heap.gpu_ptr, resource_heap.size},
+            {sampler_heap.gpu_ptr, sampler_heap.size},
+            root,
+            readback);
         if (!succeeded)
             break;
 
@@ -614,6 +656,8 @@ int main(int argc, char** argv)
     while (succeeded && pump_example_window(window));
 
     close_example_window(window);
+    device.gpu_free(sampler_heap);
+    device.gpu_free(resource_heap);
     device.gpu_free(readback);
     device.gpu_free(vertex_memory);
     return succeeded ? 0 : 1;

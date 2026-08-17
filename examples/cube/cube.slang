@@ -6,11 +6,6 @@
 [[vk::push_constant]]
 ConstantBuffer<CubeRootArguments> root;
 
-#if defined(CLEAN_GFX_DESCRIPTOR_MAPPING_FALLBACK)
-[[vk::binding(0, 0)]] Texture2D<float4> mapped_textures[];
-[[vk::binding(1, 0)]] SamplerState mapped_samplers[];
-#endif
-
 struct VertexOutput
 {
     float4 position : SV_Position;
@@ -22,10 +17,7 @@ struct VertexOutput
 VertexOutput vertexMain(uint vertex_id : SV_VertexID)
 {
     CubeVertex vertex = root.vertices[vertex_id];
-    float4 transformed = root.mvp[0] * vertex.position.x +
-                         root.mvp[1] * vertex.position.y +
-                         root.mvp[2] * vertex.position.z +
-                         root.mvp[3] * vertex.position.w;
+    float4 transformed = mul(root.mvp, vertex.position);
 
     VertexOutput output;
     output.position = transformed;
@@ -44,13 +36,8 @@ float3 linear_to_srgb(float3 linear_color)
 [shader("fragment")]
 float4 fragmentMain(VertexOutput input) : SV_Target0
 {
-#if defined(CLEAN_GFX_DESCRIPTOR_MAPPING_FALLBACK)
-    Texture2D<float4> texture = mapped_textures[root.texture_index];
-    SamplerState sampler = mapped_samplers[root.sampler_index];
-#else
     Texture2D<float4> texture = ResourceDescriptorHeap[root.texture_index];
-    SamplerState sampler = SamplerDescriptorHeap[root.sampler_index];
-#endif
+    SamplerState sampler = SamplerDescriptorHeap[uint32(CubeSampler::clamp_point)];
 
     float3 normal = normalize(cross(ddx(input.fragment_position),
                                     ddy(input.fragment_position)));

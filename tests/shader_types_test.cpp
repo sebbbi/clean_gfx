@@ -14,7 +14,7 @@ static_assert(std::is_same_v<uint64, std::uint64_t>);
 static_assert(std::is_same_v<int64, std::int64_t>);
 
 template<typename Type, typename Scalar, std::size_t ComponentCount>
-inline constexpr bool is_scalar_layout_vector =
+inline constexpr bool is_c_layout_vector =
     std::is_standard_layout_v<Type> &&
     std::is_trivial_v<Type> &&
     std::is_trivially_copyable_v<Type> &&
@@ -28,25 +28,37 @@ inline constexpr bool is_scalar_layout_vector =
     sizeof(Type) == sizeof(Scalar) * ComponentCount &&
     alignof(Type) == alignof(Scalar);
 
-static_assert(is_scalar_layout_vector<float16_t, uint16, 1>);
-static_assert(is_scalar_layout_vector<float2, float, 2>);
-static_assert(is_scalar_layout_vector<float3, float, 3>);
-static_assert(is_scalar_layout_vector<float4, float, 4>);
-static_assert(is_scalar_layout_vector<int2, int32, 2>);
-static_assert(is_scalar_layout_vector<int3, int32, 3>);
-static_assert(is_scalar_layout_vector<int4, int32, 4>);
-static_assert(is_scalar_layout_vector<uint2, uint32, 2>);
-static_assert(is_scalar_layout_vector<uint3, uint32, 3>);
-static_assert(is_scalar_layout_vector<uint4, uint32, 4>);
-static_assert(is_scalar_layout_vector<float16_t2, float16_t, 2>);
-static_assert(is_scalar_layout_vector<float16_t3, float16_t, 3>);
-static_assert(is_scalar_layout_vector<float16_t4, float16_t, 4>);
-static_assert(is_scalar_layout_vector<int16_t2, int16, 2>);
-static_assert(is_scalar_layout_vector<int16_t3, int16, 3>);
-static_assert(is_scalar_layout_vector<int16_t4, int16, 4>);
-static_assert(is_scalar_layout_vector<uint16_t2, uint16, 2>);
-static_assert(is_scalar_layout_vector<uint16_t3, uint16, 3>);
-static_assert(is_scalar_layout_vector<uint16_t4, uint16, 4>);
+static_assert(is_c_layout_vector<float16_t, uint16, 1>);
+static_assert(is_c_layout_vector<float2, float, 2>);
+static_assert(is_c_layout_vector<float3, float, 3>);
+static_assert(is_c_layout_vector<float4, float, 4>);
+static_assert(is_c_layout_vector<float2x2, float, 4>);
+static_assert(is_c_layout_vector<float3x3, float, 9>);
+static_assert(is_c_layout_vector<float4x4, float, 16>);
+static_assert(is_c_layout_vector<float3x4, float, 12>);
+static_assert(std::is_same_v<decltype(float2x2::rows), float2[2]>);
+static_assert(std::is_same_v<decltype(float3x3::rows), float3[3]>);
+static_assert(std::is_same_v<decltype(float4x4::rows), float4[4]>);
+static_assert(std::is_same_v<decltype(float3x4::rows), float4[3]>);
+static_assert(offsetof(float2x2, rows) == 0);
+static_assert(offsetof(float3x3, rows) == 0);
+static_assert(offsetof(float4x4, rows) == 0);
+static_assert(offsetof(float3x4, rows) == 0);
+static_assert(is_c_layout_vector<int2, int32, 2>);
+static_assert(is_c_layout_vector<int3, int32, 3>);
+static_assert(is_c_layout_vector<int4, int32, 4>);
+static_assert(is_c_layout_vector<uint2, uint32, 2>);
+static_assert(is_c_layout_vector<uint3, uint32, 3>);
+static_assert(is_c_layout_vector<uint4, uint32, 4>);
+static_assert(is_c_layout_vector<float16_t2, float16_t, 2>);
+static_assert(is_c_layout_vector<float16_t3, float16_t, 3>);
+static_assert(is_c_layout_vector<float16_t4, float16_t, 4>);
+static_assert(is_c_layout_vector<int16_t2, int16, 2>);
+static_assert(is_c_layout_vector<int16_t3, int16, 3>);
+static_assert(is_c_layout_vector<int16_t4, int16, 4>);
+static_assert(is_c_layout_vector<uint16_t2, uint16, 2>);
+static_assert(is_c_layout_vector<uint16_t3, uint16, 3>);
+static_assert(is_c_layout_vector<uint16_t4, uint16, 4>);
 
 #define CLEAN_GFX_TEST_VEC2(type_, scalar_)                                                   \
     static_assert(std::is_same_v<decltype(type_::x), scalar_>);                               \
@@ -96,6 +108,23 @@ constexpr float16_t2 half_pair{half_one, half_negative_two};
 constexpr int16_t3 narrow_ints{-1, 2, -3};
 constexpr uint16_t4 narrow_uints{1u, 2u, 3u, 4u};
 constexpr float3 floats{1.0f, 2.0f, 3.0f};
+constexpr float2x2 matrix2x2{{{1.0f, 2.0f}, {3.0f, 4.0f}}};
+constexpr float3x3 matrix3x3{{
+    {1.0f, 2.0f, 3.0f},
+    {4.0f, 5.0f, 6.0f},
+    {7.0f, 8.0f, 9.0f},
+}};
+constexpr float4x4 matrix4x4{{
+    {1.0f, 2.0f, 3.0f, 4.0f},
+    {5.0f, 6.0f, 7.0f, 8.0f},
+    {9.0f, 10.0f, 11.0f, 12.0f},
+    {13.0f, 14.0f, 15.0f, 16.0f},
+}};
+constexpr float3x4 matrix3x4{{
+    {1.0f, 2.0f, 3.0f, 4.0f},
+    {5.0f, 6.0f, 7.0f, 8.0f},
+    {9.0f, 10.0f, 11.0f, 12.0f},
+}};
 constexpr int4 ints{-1, 2, -3, 4};
 constexpr uint4 uints{1u, 2u, 3u, 4u};
 
@@ -105,6 +134,10 @@ static_assert(half_pair.x.bits == 0x3c00u && half_pair.y.bits == 0xc000u);
 static_assert(narrow_ints.x == -1 && narrow_ints.z == -3);
 static_assert(narrow_uints.x == 1u && narrow_uints.w == 4u);
 static_assert(floats.x == 1.0f && floats.z == 3.0f);
+static_assert(matrix2x2.rows[1].y == 4.0f);
+static_assert(matrix3x3.rows[2].z == 9.0f);
+static_assert(matrix4x4.rows[3].w == 16.0f);
+static_assert(matrix3x4.rows[2].w == 12.0f);
 static_assert(ints.x == -1 && ints.z == -3);
 static_assert(uints.x == 1u && uints.w == 4u);
 

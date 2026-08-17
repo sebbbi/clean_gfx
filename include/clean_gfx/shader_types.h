@@ -1,13 +1,11 @@
 #pragma once
 
-// Slang defines __SLANG__. CLEAN_GFX_SHADER is also recognized so custom
-// preprocessing pipelines can explicitly select the shader-facing branch.
-#if defined(CLEAN_GFX_SHADER) || defined(__SLANG__)
+#if defined(__SLANG__)
 
 // Slang already provides float[2-4], int[2-4], uint[2-4], float16_t[2-4],
-// int16_t[2-4], and uint16_t[2-4]. Redeclaring those types would hide the native vectors
-// and can change shader semantics. Only add the short scalar aliases used by
-// shared clean_gfx structures.
+// int16_t[2-4], uint16_t[2-4], and native matrix types such as float4x4.
+// Redeclaring those types would hide the built-ins and can change shader semantics.
+// Only add the short scalar aliases used by shared clean_gfx structures.
 typedef uint8_t uint8;
 typedef int8_t int8;
 typedef uint16_t uint16;
@@ -61,6 +59,28 @@ struct float4
     float y;
     float z;
     float w;
+};
+
+// Slang matrix names use row-count x column-count. Each C++ POD stores one
+// vector per row, matching the row-major shader layout.
+struct float2x2
+{
+    float2 rows[2];
+};
+
+struct float3x3
+{
+    float3 rows[3];
+};
+
+struct float4x4
+{
+    float4 rows[4];
+};
+
+struct float3x4
+{
+    float4 rows[3];
 };
 
 struct int2
@@ -227,6 +247,10 @@ static_assert(offsetof(float16_t, bits) == 0);
 CLEAN_GFX_ASSERT_SHARED_VEC2(float2, float);
 CLEAN_GFX_ASSERT_SHARED_VEC3(float3, float);
 CLEAN_GFX_ASSERT_SHARED_VEC4(float4, float);
+CLEAN_GFX_ASSERT_SHARED_TYPE(float2x2, float, 4);
+CLEAN_GFX_ASSERT_SHARED_TYPE(float3x3, float, 9);
+CLEAN_GFX_ASSERT_SHARED_TYPE(float4x4, float, 16);
+CLEAN_GFX_ASSERT_SHARED_TYPE(float3x4, float, 12);
 CLEAN_GFX_ASSERT_SHARED_VEC2(int2, int32);
 CLEAN_GFX_ASSERT_SHARED_VEC3(int3, int32);
 CLEAN_GFX_ASSERT_SHARED_VEC4(int4, int32);
