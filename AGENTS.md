@@ -13,4 +13,6 @@
 - Do not use mutexes or atomics. The API is intentionally single-threaded and is not thread-safe yet.
 - Avoid copying user data structures. Prefer references to structures, and use spans for array data in structures and function parameters.
 - Use a custom span type represented by a pointer and size. It must support construction from an initializer list so variable-length arguments remain concise. An initializer list passed as a function argument remains alive through that function call; do not retain a span backed by it after the call returns.
+- Use C++20 designated initializers with named fields for structures.
+- Give public API structure fields useful default values. At call sites, initialize only the non-default fields and name every initialized field.
 - Always review code for performance issues before considering work complete.

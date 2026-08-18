@@ -20,8 +20,7 @@ enum class CubeSampler : uint32
 struct CubeRootArguments
 {
     CubeVertex* vertices;
-    uint32 texture_index;
-    uint32 padding;
     float3x4 transform;
     float2 depth_transform;
+    uint32 texture_index;
 };

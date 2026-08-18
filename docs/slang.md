@@ -14,6 +14,10 @@ layouts in the shader compilation path described below.
 The host side uses free functions in namespace `gfx` over opaque `Device*`, `Texture*`,
 `Pipeline*`, and `CommandList*` handles. Textures, pipelines, and devices are destroyed explicitly;
 submitting a command list consumes its handle. These are raw handles rather than RAII wrappers.
+Pipeline descriptions carry SPIR-V words in the custom `Span<const uint32_t>` pointer/count type.
+The span owns nothing and is consumed during the creation call. It accepts a pointer and count, a C
+array, or an initializer list used directly as a call argument; initializer-list-backed storage
+must not be retained after that call.
 
 ## Supported Slang version
 
@@ -145,7 +149,7 @@ Descriptor heaps have explicit free-function allocation calls because Vulkan giv
 heap-specific size, alignment, and reserved-range rules:
 
 ```cpp
-const gfx::DeviceCaps caps = gfx::get_device_caps(device);
+const gfx::DeviceCaps& caps = gfx::get_device_caps(device);
 gfx::GpuAllocation<std::byte> resource_heap = gfx::gpu_malloc_resource_heap(
     device, caps.image_descriptor_size);
 gfx::GpuAllocation<std::byte> sampler_heap = gfx::gpu_malloc_sampler_heap(
@@ -201,8 +205,7 @@ gfx::draw(commands, nullptr, 3);
 Otherwise, the root is an ordinary CPU POD and the typed overload infers its complete size:
 
 ```cpp
-RootArguments root{};
-root.vertices = vertices.gpu;
+const RootArguments root{.vertices = vertices.gpu};
 
 gfx::draw(commands, &root, vertex_count);
 // gfx::dispatch(commands, &root, x, y, z);
@@ -238,15 +241,14 @@ Shared structures use an ordinary pointer type for a device pointer. The cube ro
 struct CubeRootArguments
 {
     CubeVertex* vertices;
-    uint32 texture_index;
-    uint32 padding;
     float3x4 transform;
     float2 depth_transform;
+    uint32 texture_index;
 };
 ```
 
 The triangle is rootless. The cube's sampler selection is the shared compile-time `CubeSampler`
-enum rather than another root value. Both C++ and Slang see a typed `CubeVertex*`. `gpu_malloc<T>()` returns a trivial
+enum rather than another root value. Both C++ and Slang see a typed `CubeVertex*`. `gpu_malloc<T>()` returns a
 `GpuAllocation<T> {cpu, gpu, size}` aggregate. The default `MemoryType::default_` and readback
 allocations provide both addresses from coherent mapped device-local memory. The allocation holds the vertices; the root itself remains an
 ordinary CPU value:
@@ -271,18 +273,18 @@ the `PhysicalStorageBufferAddresses` capability, and the
 is `Ptr<T, Access.Read, AddressSpace.Device>`, but the native `T*` spelling keeps
 the shared header simple.
 
-`gpu_malloc()` with `MemoryType::gpu_only` still returns the same POD, but `cpu`
+`gpu_malloc()` with `MemoryType::gpu_only` still returns the same aggregate, but `cpu`
 is null because the allocation is not host-visible; `gpu` and `size` remain
-valid. `gpu_free()` takes the complete, unchanged `GpuAllocation` returned by
+valid. `gpu_free()` takes the complete, unchanged `GpuAllocation` by reference after it is returned by
 `gpu_malloc()`, not one of its pointers or a manually constructed range.
 
 If GPU memory cannot satisfy an allocation, `gpu_malloc()` and the two descriptor-heap allocation
-functions return `GpuAllocation {nullptr, nullptr, 0}`. A successful `MemoryType::gpu_only` allocation
+functions return the default null `GpuAllocation {}`. A successful `MemoryType::gpu_only` allocation
 also has a null `cpu`, so `gpu` is the validity field. The examples keep
 their paths direct and deliberately do not test their small allocations for failure.
 
-Address-based command APIs use a second trivial aggregate,
-`GpuRange {gpu, size}`. Call `gpu_range(allocation)` for a whole allocation, or supply an interior
+Address-based command APIs use a second small aggregate,
+`GpuRange {gpu, size}`. Commands take ranges by reference. Call `gpu_range(allocation)` for a whole allocation, or supply an interior
 GPU pointer and the exact byte count for
 that subrange. The backend passes this address/size pair directly to the Vulkan
 device-address command. Command recording performs no allocation lookup and does not retain the
@@ -296,7 +298,7 @@ the page's base address with `vkGetBufferDeviceAddress` and suballocates it with
 pages are created on exhaustion. `MemoryType::default_` is not a host-only staging class: device
 creation rejects hardware without coherent host-visible memory on a device-local heap. Descriptor
 heaps use their dedicated buffers described above. No Vulkan buffer handle or owning allocation
-class is visible to the application; `GpuAllocation` and `GpuRange` are only POD address/size
+class is visible to the application; `GpuAllocation` and `GpuRange` are only plain address/size
 carriers.
 
 Important pointer limitations are:

@@ -8,14 +8,13 @@
 
 #include <clean_gfx/clean_gfx.hpp>
 
-#include <array>
+#include <cassert>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
-#include <iostream>
+#include <cstdio>
 #include <numbers>
-#include <vector>
 
 #if defined(_WIN32)
 #include "lunarg_logo_png.hpp"
@@ -38,83 +37,119 @@ constexpr std::uint32_t width = 500;
 constexpr std::uint32_t height = 500;
 constexpr std::uint32_t texture_width = 256;
 constexpr std::uint32_t texture_height = 256;
+constexpr std::size_t texture_byte_count =
+    static_cast<std::size_t>(texture_width) * texture_height * 4;
 constexpr float radians_per_frame = 4.0f * std::numbers::pi_v<float> / 180.0f;
 
-constexpr std::array<CubeVertex, 36> cube_vertices{{
-    {{-1.0f, -1.0f, -1.0f, 1.0f}, {0.0f, 1.0f}},
-    {{-1.0f, -1.0f,  1.0f, 1.0f}, {1.0f, 1.0f}},
-    {{-1.0f,  1.0f,  1.0f, 1.0f}, {1.0f, 0.0f}},
-    {{-1.0f,  1.0f,  1.0f, 1.0f}, {1.0f, 0.0f}},
-    {{-1.0f,  1.0f, -1.0f, 1.0f}, {0.0f, 0.0f}},
-    {{-1.0f, -1.0f, -1.0f, 1.0f}, {0.0f, 1.0f}},
+constexpr CubeVertex cube_vertices[] = {
+    {.position = {.x = -1.0f, .y = -1.0f, .z = -1.0f, .w = 1.0f},
+     .uv = {.x = 0.0f, .y = 1.0f}},
+    {.position = {.x = -1.0f, .y = -1.0f, .z = 1.0f, .w = 1.0f},
+     .uv = {.x = 1.0f, .y = 1.0f}},
+    {.position = {.x = -1.0f, .y = 1.0f, .z = 1.0f, .w = 1.0f},
+     .uv = {.x = 1.0f, .y = 0.0f}},
+    {.position = {.x = -1.0f, .y = 1.0f, .z = 1.0f, .w = 1.0f},
+     .uv = {.x = 1.0f, .y = 0.0f}},
+    {.position = {.x = -1.0f, .y = 1.0f, .z = -1.0f, .w = 1.0f},
+     .uv = {.x = 0.0f, .y = 0.0f}},
+    {.position = {.x = -1.0f, .y = -1.0f, .z = -1.0f, .w = 1.0f},
+     .uv = {.x = 0.0f, .y = 1.0f}},
 
-    {{-1.0f, -1.0f, -1.0f, 1.0f}, {1.0f, 1.0f}},
-    {{ 1.0f,  1.0f, -1.0f, 1.0f}, {0.0f, 0.0f}},
-    {{ 1.0f, -1.0f, -1.0f, 1.0f}, {0.0f, 1.0f}},
-    {{-1.0f, -1.0f, -1.0f, 1.0f}, {1.0f, 1.0f}},
-    {{-1.0f,  1.0f, -1.0f, 1.0f}, {1.0f, 0.0f}},
-    {{ 1.0f,  1.0f, -1.0f, 1.0f}, {0.0f, 0.0f}},
+    {.position = {.x = -1.0f, .y = -1.0f, .z = -1.0f, .w = 1.0f},
+     .uv = {.x = 1.0f, .y = 1.0f}},
+    {.position = {.x = 1.0f, .y = 1.0f, .z = -1.0f, .w = 1.0f},
+     .uv = {.x = 0.0f, .y = 0.0f}},
+    {.position = {.x = 1.0f, .y = -1.0f, .z = -1.0f, .w = 1.0f},
+     .uv = {.x = 0.0f, .y = 1.0f}},
+    {.position = {.x = -1.0f, .y = -1.0f, .z = -1.0f, .w = 1.0f},
+     .uv = {.x = 1.0f, .y = 1.0f}},
+    {.position = {.x = -1.0f, .y = 1.0f, .z = -1.0f, .w = 1.0f},
+     .uv = {.x = 1.0f, .y = 0.0f}},
+    {.position = {.x = 1.0f, .y = 1.0f, .z = -1.0f, .w = 1.0f},
+     .uv = {.x = 0.0f, .y = 0.0f}},
 
-    {{-1.0f, -1.0f, -1.0f, 1.0f}, {1.0f, 0.0f}},
-    {{ 1.0f, -1.0f, -1.0f, 1.0f}, {1.0f, 1.0f}},
-    {{ 1.0f, -1.0f,  1.0f, 1.0f}, {0.0f, 1.0f}},
-    {{-1.0f, -1.0f, -1.0f, 1.0f}, {1.0f, 0.0f}},
-    {{ 1.0f, -1.0f,  1.0f, 1.0f}, {0.0f, 1.0f}},
-    {{-1.0f, -1.0f,  1.0f, 1.0f}, {0.0f, 0.0f}},
+    {.position = {.x = -1.0f, .y = -1.0f, .z = -1.0f, .w = 1.0f},
+     .uv = {.x = 1.0f, .y = 0.0f}},
+    {.position = {.x = 1.0f, .y = -1.0f, .z = -1.0f, .w = 1.0f},
+     .uv = {.x = 1.0f, .y = 1.0f}},
+    {.position = {.x = 1.0f, .y = -1.0f, .z = 1.0f, .w = 1.0f},
+     .uv = {.x = 0.0f, .y = 1.0f}},
+    {.position = {.x = -1.0f, .y = -1.0f, .z = -1.0f, .w = 1.0f},
+     .uv = {.x = 1.0f, .y = 0.0f}},
+    {.position = {.x = 1.0f, .y = -1.0f, .z = 1.0f, .w = 1.0f},
+     .uv = {.x = 0.0f, .y = 1.0f}},
+    {.position = {.x = -1.0f, .y = -1.0f, .z = 1.0f, .w = 1.0f},
+     .uv = {.x = 0.0f, .y = 0.0f}},
 
-    {{-1.0f,  1.0f, -1.0f, 1.0f}, {1.0f, 0.0f}},
-    {{-1.0f,  1.0f,  1.0f, 1.0f}, {0.0f, 0.0f}},
-    {{ 1.0f,  1.0f,  1.0f, 1.0f}, {0.0f, 1.0f}},
-    {{-1.0f,  1.0f, -1.0f, 1.0f}, {1.0f, 0.0f}},
-    {{ 1.0f,  1.0f,  1.0f, 1.0f}, {0.0f, 1.0f}},
-    {{ 1.0f,  1.0f, -1.0f, 1.0f}, {1.0f, 1.0f}},
+    {.position = {.x = -1.0f, .y = 1.0f, .z = -1.0f, .w = 1.0f},
+     .uv = {.x = 1.0f, .y = 0.0f}},
+    {.position = {.x = -1.0f, .y = 1.0f, .z = 1.0f, .w = 1.0f},
+     .uv = {.x = 0.0f, .y = 0.0f}},
+    {.position = {.x = 1.0f, .y = 1.0f, .z = 1.0f, .w = 1.0f},
+     .uv = {.x = 0.0f, .y = 1.0f}},
+    {.position = {.x = -1.0f, .y = 1.0f, .z = -1.0f, .w = 1.0f},
+     .uv = {.x = 1.0f, .y = 0.0f}},
+    {.position = {.x = 1.0f, .y = 1.0f, .z = 1.0f, .w = 1.0f},
+     .uv = {.x = 0.0f, .y = 1.0f}},
+    {.position = {.x = 1.0f, .y = 1.0f, .z = -1.0f, .w = 1.0f},
+     .uv = {.x = 1.0f, .y = 1.0f}},
 
-    {{ 1.0f,  1.0f, -1.0f, 1.0f}, {1.0f, 0.0f}},
-    {{ 1.0f,  1.0f,  1.0f, 1.0f}, {0.0f, 0.0f}},
-    {{ 1.0f, -1.0f,  1.0f, 1.0f}, {0.0f, 1.0f}},
-    {{ 1.0f, -1.0f,  1.0f, 1.0f}, {0.0f, 1.0f}},
-    {{ 1.0f, -1.0f, -1.0f, 1.0f}, {1.0f, 1.0f}},
-    {{ 1.0f,  1.0f, -1.0f, 1.0f}, {1.0f, 0.0f}},
+    {.position = {.x = 1.0f, .y = 1.0f, .z = -1.0f, .w = 1.0f},
+     .uv = {.x = 1.0f, .y = 0.0f}},
+    {.position = {.x = 1.0f, .y = 1.0f, .z = 1.0f, .w = 1.0f},
+     .uv = {.x = 0.0f, .y = 0.0f}},
+    {.position = {.x = 1.0f, .y = -1.0f, .z = 1.0f, .w = 1.0f},
+     .uv = {.x = 0.0f, .y = 1.0f}},
+    {.position = {.x = 1.0f, .y = -1.0f, .z = 1.0f, .w = 1.0f},
+     .uv = {.x = 0.0f, .y = 1.0f}},
+    {.position = {.x = 1.0f, .y = -1.0f, .z = -1.0f, .w = 1.0f},
+     .uv = {.x = 1.0f, .y = 1.0f}},
+    {.position = {.x = 1.0f, .y = 1.0f, .z = -1.0f, .w = 1.0f},
+     .uv = {.x = 1.0f, .y = 0.0f}},
 
-    {{-1.0f,  1.0f,  1.0f, 1.0f}, {0.0f, 0.0f}},
-    {{-1.0f, -1.0f,  1.0f, 1.0f}, {0.0f, 1.0f}},
-    {{ 1.0f,  1.0f,  1.0f, 1.0f}, {1.0f, 0.0f}},
-    {{-1.0f, -1.0f,  1.0f, 1.0f}, {0.0f, 1.0f}},
-    {{ 1.0f, -1.0f,  1.0f, 1.0f}, {1.0f, 1.0f}},
-    {{ 1.0f,  1.0f,  1.0f, 1.0f}, {1.0f, 0.0f}},
-}};
+    {.position = {.x = -1.0f, .y = 1.0f, .z = 1.0f, .w = 1.0f},
+     .uv = {.x = 0.0f, .y = 0.0f}},
+    {.position = {.x = -1.0f, .y = -1.0f, .z = 1.0f, .w = 1.0f},
+     .uv = {.x = 0.0f, .y = 1.0f}},
+    {.position = {.x = 1.0f, .y = 1.0f, .z = 1.0f, .w = 1.0f},
+     .uv = {.x = 1.0f, .y = 0.0f}},
+    {.position = {.x = -1.0f, .y = -1.0f, .z = 1.0f, .w = 1.0f},
+     .uv = {.x = 0.0f, .y = 1.0f}},
+    {.position = {.x = 1.0f, .y = -1.0f, .z = 1.0f, .w = 1.0f},
+     .uv = {.x = 1.0f, .y = 1.0f}},
+    {.position = {.x = 1.0f, .y = 1.0f, .z = 1.0f, .w = 1.0f},
+     .uv = {.x = 1.0f, .y = 0.0f}},
+};
+
+constexpr std::size_t cube_vertex_count =
+    sizeof(cube_vertices) / sizeof(cube_vertices[0]);
 
 struct Matrix
 {
     float element[4][4]{};
 };
 
-float3 subtract(float3 lhs, float3 rhs) noexcept
-{
-    return {lhs.x - rhs.x, lhs.y - rhs.y, lhs.z - rhs.z};
-}
-
-float dot(float3 lhs, float3 rhs) noexcept
+float dot(const float3& lhs, const float3& rhs) noexcept
 {
     return lhs.x * rhs.x + lhs.y * rhs.y + lhs.z * rhs.z;
 }
 
-float3 cross(float3 lhs, float3 rhs) noexcept
+float3 cross(const float3& lhs, const float3& rhs) noexcept
 {
     return {
-        lhs.y * rhs.z - lhs.z * rhs.y,
-        lhs.z * rhs.x - lhs.x * rhs.z,
-        lhs.x * rhs.y - lhs.y * rhs.x,
+        .x = lhs.y * rhs.z - lhs.z * rhs.y,
+        .y = lhs.z * rhs.x - lhs.x * rhs.z,
+        .z = lhs.x * rhs.y - lhs.y * rhs.x,
     };
 }
 
-float3 normalize(float3 value) noexcept
+float3 normalize(const float3& value) noexcept
 {
     const float reciprocal_length = 1.0f / std::sqrt(dot(value, value));
     return {
-        value.x * reciprocal_length,
-        value.y * reciprocal_length,
-        value.z * reciprocal_length,
+        .x = value.x * reciprocal_length,
+        .y = value.y * reciprocal_length,
+        .z = value.z * reciprocal_length,
     };
 }
 
@@ -164,9 +199,15 @@ Matrix perspective(float vertical_field_of_view,
     return result;
 }
 
-Matrix look_at(float3 eye, float3 center, float3 up) noexcept
+Matrix look_at(const float3& eye,
+               const float3& center,
+               const float3& up) noexcept
 {
-    const float3 forward = normalize(subtract(center, eye));
+    const float3 forward = normalize({
+        .x = center.x - eye.x,
+        .y = center.y - eye.y,
+        .z = center.z - eye.z,
+    });
     const float3 side = normalize(cross(forward, up));
     const float3 camera_up = cross(side, forward);
 
@@ -189,21 +230,21 @@ Matrix look_at(float3 eye, float3 center, float3 up) noexcept
 
 float3x4 shader_matrix(const Matrix& source) noexcept
 {
-    float3x4 result{};
+    float3x4 result{.rows = {}};
     for (std::uint32_t row = 0; row != 2; ++row)
     {
         result.rows[row] = {
-            source.element[0][row],
-            source.element[1][row],
-            source.element[2][row],
-            source.element[3][row],
+            .x = source.element[0][row],
+            .y = source.element[1][row],
+            .z = source.element[2][row],
+            .w = source.element[3][row],
         };
     }
     result.rows[2] = {
-        source.element[0][3],
-        source.element[1][3],
-        source.element[2][3],
-        source.element[3][3],
+        .x = source.element[0][3],
+        .y = source.element[1][3],
+        .z = source.element[2][3],
+        .w = source.element[3][3],
     };
     return result;
 }
@@ -227,54 +268,47 @@ int base64_value(char character) noexcept
     return -1;
 }
 
-std::vector<std::byte> decode_base64() noexcept
+std::size_t decode_base64(gfx::Span<std::byte> output) noexcept
 {
     constexpr std::size_t length = sizeof(lunarg_logo_png_base64) - 1;
-    if (length == 0 || length % 4 != 0)
-        return {};
+    assert(length != 0 && length % 4 == 0);
+    assert(output.data && output.size >= length / 4 * 3);
 
-    std::vector<std::byte> output;
-    output.reserve(length / 4 * 3);
+    std::size_t output_size = 0;
     for (std::size_t offset = 0; offset != length; offset += 4)
     {
         const int a = base64_value(lunarg_logo_png_base64[offset + 0]);
         const int b = base64_value(lunarg_logo_png_base64[offset + 1]);
         const int c = base64_value(lunarg_logo_png_base64[offset + 2]);
         const int d = base64_value(lunarg_logo_png_base64[offset + 3]);
-        const bool last_group = offset + 4 == length;
-        if (a < 0 || b < 0 || c == -1 || d == -1 ||
-            (c == -2 && d != -2) ||
-            ((c == -2 || d == -2) && !last_group))
-            return {};
+        assert(a >= 0 && b >= 0 && c != -1 && d != -1);
+        assert(c != -2 || d == -2);
+        assert((c != -2 && d != -2) || offset + 4 == length);
 
         const std::uint32_t bits = (static_cast<std::uint32_t>(a) << 18u) |
                                    (static_cast<std::uint32_t>(b) << 12u) |
                                    (static_cast<std::uint32_t>(c < 0 ? 0 : c) << 6u) |
                                    static_cast<std::uint32_t>(d < 0 ? 0 : d);
-        output.push_back(static_cast<std::byte>((bits >> 16u) & 0xffu));
+        output.data[output_size++] =
+            static_cast<std::byte>((bits >> 16u) & 0xffu);
         if (c != -2)
-            output.push_back(static_cast<std::byte>((bits >> 8u) & 0xffu));
+        {
+            output.data[output_size++] =
+                static_cast<std::byte>((bits >> 8u) & 0xffu);
+        }
         if (d != -2)
-            output.push_back(static_cast<std::byte>(bits & 0xffu));
+            output.data[output_size++] = static_cast<std::byte>(bits & 0xffu);
     }
-    return output;
+    return output_size;
 }
 
-template<typename T>
-void release_com(T*& object) noexcept
+bool make_texture(gfx::Span<std::byte> pixels) noexcept
 {
-    if (object)
-        object->Release();
-    object = nullptr;
-}
-
-std::vector<std::byte> make_texture() noexcept
-{
-    std::vector<std::byte> png = decode_base64();
-    if (png.empty())
-        return {};
-
-    std::vector<std::byte> pixels;
+    assert(pixels.data && pixels.size == texture_byte_count);
+    constexpr std::size_t encoded_length =
+        sizeof(lunarg_logo_png_base64) - 1;
+    std::byte png[encoded_length / 4 * 3]{};
+    const std::size_t png_size = decode_base64(gfx::Span<std::byte>{png});
 
     const HRESULT initialize_result =
         CoInitializeEx(nullptr, COINIT_MULTITHREADED);
@@ -300,8 +334,8 @@ std::vector<std::byte> make_texture() noexcept
     if (SUCCEEDED(result))
     {
         result = stream->InitializeFromMemory(
-            reinterpret_cast<BYTE*>(png.data()),
-            static_cast<DWORD>(png.size()));
+            reinterpret_cast<BYTE*>(png),
+            static_cast<DWORD>(png_size));
     }
     if (SUCCEEDED(result))
     {
@@ -330,33 +364,32 @@ std::vector<std::byte> make_texture() noexcept
     }
     if (SUCCEEDED(result))
     {
-        pixels.resize(static_cast<std::size_t>(texture_width) *
-                      texture_height * 4);
         result = converter->CopyPixels(
             nullptr, texture_width * 4,
-            static_cast<UINT>(pixels.size()),
-            reinterpret_cast<BYTE*>(pixels.data()));
+            static_cast<UINT>(pixels.size),
+            reinterpret_cast<BYTE*>(pixels.data));
     }
 
-    release_com(converter);
-    release_com(frame);
-    release_com(decoder);
-    release_com(stream);
-    release_com(factory);
+    if (converter)
+        converter->Release();
+    if (frame)
+        frame->Release();
+    if (decoder)
+        decoder->Release();
+    if (stream)
+        stream->Release();
+    if (factory)
+        factory->Release();
     if (uninitialize)
         CoUninitialize();
-    if (FAILED(result))
-        return {};
-    return pixels;
+    return SUCCEEDED(result);
 }
 
 #else
 
-std::vector<std::byte> make_texture() noexcept
+bool make_texture(gfx::Span<std::byte> pixels) noexcept
 {
-    std::vector<std::byte> pixels;
-    pixels.resize(
-        static_cast<std::size_t>(texture_width) * texture_height * 4);
+    assert(pixels.data && pixels.size == texture_byte_count);
     for (std::uint32_t y = 0; y != texture_height; ++y)
     {
         for (std::uint32_t x = 0; x != texture_width; ++x)
@@ -384,13 +417,13 @@ std::vector<std::byte> make_texture() noexcept
 
             const std::size_t offset =
                 (static_cast<std::size_t>(y) * texture_width + x) * 4;
-            pixels[offset + 0] = static_cast<std::byte>(red);
-            pixels[offset + 1] = static_cast<std::byte>(green);
-            pixels[offset + 2] = static_cast<std::byte>(blue);
-            pixels[offset + 3] = static_cast<std::byte>(255u);
+            pixels.data[offset + 0] = static_cast<std::byte>(red);
+            pixels.data[offset + 1] = static_cast<std::byte>(green);
+            pixels.data[offset + 2] = static_cast<std::byte>(blue);
+            pixels.data[offset + 3] = static_cast<std::byte>(255u);
         }
     }
-    return pixels;
+    return true;
 }
 
 #endif
@@ -399,10 +432,10 @@ void render_frame(gfx::Device* device,
                   gfx::Pipeline* pipeline,
                   gfx::Texture* target,
                   gfx::Texture* depth,
-                  gfx::GpuRange resource_heap,
-                  gfx::GpuRange sampler_heap,
+                  const gfx::GpuRange& resource_heap,
+                  const gfx::GpuRange& sampler_heap,
                   const CubeRootArguments& root,
-                  gfx::GpuAllocation<std::byte> readback) noexcept
+                  const gfx::GpuRange& readback) noexcept
 {
     gfx::CommandList* commands = gfx::begin_commands(device);
     gfx::barrier(commands,
@@ -413,16 +446,21 @@ void render_frame(gfx::Device* device,
     gfx::set_resource_heap(commands, resource_heap);
     gfx::set_sampler_heap(commands, sampler_heap);
     gfx::begin_rendering(
-        commands, target, {0.2f, 0.2f, 0.2f, 0.2f}, true, depth, 1.0f);
+        commands,
+        target,
+        {.x = 0.2f, .y = 0.2f, .z = 0.2f, .w = 0.2f},
+        true,
+        depth,
+        1.0f);
     gfx::bind_pipeline(commands, pipeline);
-    gfx::draw(commands, &root, static_cast<std::uint32_t>(cube_vertices.size()));
+    gfx::draw(commands, &root, static_cast<std::uint32_t>(cube_vertex_count));
     gfx::end_rendering(commands);
     gfx::barrier(commands,
                  gfx::Stage::color_output,
                  gfx::Access::color_write,
                  gfx::Stage::transfer,
                  gfx::Access::transfer_read);
-    gfx::copy_texture_to_memory(commands, target, gfx::gpu_range(readback));
+    gfx::copy_texture_to_memory(commands, target, readback);
     gfx::barrier(commands,
                  gfx::Stage::transfer,
                  gfx::Access::transfer_write,
@@ -438,24 +476,19 @@ int main(int argc, char** argv)
     const char* output_path = argc > 1 ? argv[1] : nullptr;
     if (!output_path && !example_window_supported)
     {
-        std::cerr << application_name
-                  << ": interactive presentation is only available on Windows; "
-                     "pass an output PPM path instead\n";
+        std::fprintf(
+            stderr,
+            "%s: interactive presentation is only available on Windows; "
+            "pass an output PPM path instead\n",
+            application_name);
         return 1;
     }
 
-    const std::vector<std::byte> texture_pixels = make_texture();
-    if (texture_pixels.empty())
-    {
-        std::cerr << application_name << ": could not decode embedded cube texture\n";
-        return 1;
-    }
-
-    const std::vector<std::uint32_t> vertex_spirv =
+    const ShaderCode vertex_spirv =
         read_spirv(application_name, CLEAN_GFX_CUBE_VERTEX_SPV_PATH);
-    const std::vector<std::uint32_t> fragment_spirv =
+    const ShaderCode fragment_spirv =
         read_spirv(application_name, CLEAN_GFX_CUBE_FRAGMENT_SPV_PATH);
-    if (vertex_spirv.empty() || fragment_spirv.empty())
+    if (vertex_spirv.size == 0 || fragment_spirv.size == 0)
         return 1;
 
     const gfx::DeviceInit device_init = gfx::create_device({
@@ -463,13 +496,28 @@ int main(int argc, char** argv)
     });
     if (device_init.error != gfx::Error::none)
     {
-        std::cerr << application_name << ": create device: "
-                  << gfx_error_name(device_init.error) << '\n';
+        std::fprintf(stderr,
+                     "%s: create device: %s\n",
+                     application_name,
+                     gfx_error_name(device_init.error));
         return 1;
     }
     gfx::Device* device = device_init.device;
-    const gfx::DeviceCaps caps = gfx::get_device_caps(device);
-    std::cout << "Using " << caps.device_name << '\n';
+    const gfx::DeviceCaps& caps = gfx::get_device_caps(device);
+    std::printf("Using %s\n", caps.device_name);
+
+    gfx::GpuAllocation<std::byte> texture_upload =
+        gfx::gpu_malloc<std::byte>(device, texture_byte_count);
+    if (!make_texture(gfx::Span<std::byte>{
+            texture_upload.cpu, texture_byte_count}))
+    {
+        std::fprintf(stderr,
+                     "%s: could not decode embedded cube texture\n",
+                     application_name);
+        gfx::gpu_free(device, texture_upload);
+        gfx::destroy_device(device);
+        return 1;
+    }
 
     const std::uint64_t resource_heap_size = caps.image_descriptor_size;
     const std::uint64_t sampler_heap_size =
@@ -481,24 +529,17 @@ int main(int argc, char** argv)
         gfx::gpu_malloc_sampler_heap(device, sampler_heap_size);
 
     gfx::GpuAllocation<CubeVertex> vertex_memory =
-        gfx::gpu_malloc<CubeVertex>(device, cube_vertices.size());
-    std::memcpy(vertex_memory.cpu, cube_vertices.data(), sizeof(cube_vertices));
-
-    gfx::GpuAllocation<std::byte> texture_upload =
-        gfx::gpu_malloc<std::byte>(device, texture_pixels.size());
-    std::memcpy(texture_upload.cpu, texture_pixels.data(), texture_pixels.size());
+        gfx::gpu_malloc<CubeVertex>(device, cube_vertex_count);
+    std::memcpy(vertex_memory.cpu, cube_vertices, sizeof(cube_vertices));
 
     gfx::Texture* texture = gfx::create_texture(
         device,
         {
             .width = texture_width,
             .height = texture_height,
-            .depth = 1,
-            .mip_levels = 1,
             .format = gfx::Format::rgba8_srgb,
             .usage = gfx::TextureUsage::sampled |
                      gfx::TextureUsage::transfer_destination,
-            .name = "cube texture",
         });
 
     gfx::write_texture_descriptor(device,
@@ -506,46 +547,52 @@ int main(int argc, char** argv)
                                   texture,
                                   gfx::TextureDescriptorType::sampled);
 
-    const std::array<gfx::SamplerDesc,
-                     static_cast<std::size_t>(CubeSampler::count)> sampler_descs{{
-        {},
-        {
-            .min_filter = gfx::Filter::nearest,
-            .mag_filter = gfx::Filter::nearest,
-        },
-        {
-            .address_u = gfx::AddressMode::clamp_to_edge,
-            .address_v = gfx::AddressMode::clamp_to_edge,
-            .address_w = gfx::AddressMode::clamp_to_edge,
-        },
-        {
-            .min_filter = gfx::Filter::nearest,
-            .mag_filter = gfx::Filter::nearest,
-            .address_u = gfx::AddressMode::clamp_to_edge,
-            .address_v = gfx::AddressMode::clamp_to_edge,
-            .address_w = gfx::AddressMode::clamp_to_edge,
-        },
-    }};
     std::byte* sampler_descriptors = sampler_heap.cpu;
-    for (std::size_t index = 0; index < sampler_descs.size(); ++index)
-    {
-        gfx::write_sampler_descriptor(
-            device,
-            sampler_descriptors + index * caps.sampler_descriptor_size,
-            sampler_descs[index]);
-    }
+    gfx::write_sampler_descriptor(
+        device,
+        sampler_descriptors +
+            static_cast<std::size_t>(CubeSampler::wrap_linear) *
+                caps.sampler_descriptor_size);
+    gfx::write_sampler_descriptor(
+        device,
+        sampler_descriptors +
+            static_cast<std::size_t>(CubeSampler::wrap_point) *
+                caps.sampler_descriptor_size,
+        {
+            .min_filter = gfx::Filter::nearest,
+            .mag_filter = gfx::Filter::nearest,
+        });
+    gfx::write_sampler_descriptor(
+        device,
+        sampler_descriptors +
+            static_cast<std::size_t>(CubeSampler::clamp_linear) *
+                caps.sampler_descriptor_size,
+        {
+            .address_u = gfx::AddressMode::clamp_to_edge,
+            .address_v = gfx::AddressMode::clamp_to_edge,
+            .address_w = gfx::AddressMode::clamp_to_edge,
+        });
+    gfx::write_sampler_descriptor(
+        device,
+        sampler_descriptors +
+            static_cast<std::size_t>(CubeSampler::clamp_point) *
+                caps.sampler_descriptor_size,
+        {
+            .min_filter = gfx::Filter::nearest,
+            .mag_filter = gfx::Filter::nearest,
+            .address_u = gfx::AddressMode::clamp_to_edge,
+            .address_v = gfx::AddressMode::clamp_to_edge,
+            .address_w = gfx::AddressMode::clamp_to_edge,
+        });
 
     gfx::Texture* target = gfx::create_texture(
         device,
         {
             .width = width,
             .height = height,
-            .depth = 1,
-            .mip_levels = 1,
             .format = gfx::Format::bgra8_unorm,
             .usage = gfx::TextureUsage::color_attachment |
                      gfx::TextureUsage::transfer_source,
-            .name = "cube color target",
         });
 
     gfx::Texture* depth = gfx::create_texture(
@@ -553,30 +600,29 @@ int main(int argc, char** argv)
         {
             .width = width,
             .height = height,
-            .depth = 1,
-            .mip_levels = 1,
             .format = gfx::Format::d32_float,
             .usage = gfx::TextureUsage::depth_attachment,
-            .name = "cube depth target",
         });
 
     gfx::GpuAllocation<std::byte> readback = gfx::gpu_malloc<std::byte>(
         device,
         static_cast<std::uint64_t>(width) * height * 4,
         gfx::MemoryType::readback);
+    const gfx::GpuRange resource_heap_range = gfx::gpu_range(resource_heap);
+    const gfx::GpuRange sampler_heap_range = gfx::gpu_range(sampler_heap);
+    const gfx::GpuRange readback_range = gfx::gpu_range(readback);
 
     gfx::Pipeline* pipeline = gfx::create_graphics_pipeline(
         device,
         {
-            .vertex_spirv = vertex_spirv,
-            .fragment_spirv = fragment_spirv,
+            .vertex_spirv = gfx::Span<const std::uint32_t>{
+                vertex_spirv.words.data(), vertex_spirv.size},
+            .fragment_spirv = gfx::Span<const std::uint32_t>{
+                fragment_spirv.words.data(), fragment_spirv.size},
             .color_format = gfx::Format::bgra8_unorm,
-            .depth_format = gfx::Format::d32_float,
             .depth_enabled = true,
             .depth_write = true,
-            .topology = gfx::PrimitiveTopology::triangle_list,
             .cull = gfx::CullMode::clockwise,
-            .name = "cube pipeline",
         });
 
     gfx::CommandList* upload_commands = gfx::begin_commands(device);
@@ -591,9 +637,9 @@ int main(int argc, char** argv)
     gfx::submit_and_wait(device, upload_commands);
     gfx::gpu_free(device, texture_upload);
 
-    const Matrix view = look_at({0.0f, 3.0f, 5.0f},
-                                {0.0f, 0.0f, 0.0f},
-                                {0.0f, 1.0f, 0.0f});
+    const Matrix view = look_at({.x = 0.0f, .y = 3.0f, .z = 5.0f},
+                                {.x = 0.0f, .y = 0.0f, .z = 0.0f},
+                                {.x = 0.0f, .y = 1.0f, .z = 0.0f});
     const Matrix projection = perspective(
         45.0f * std::numbers::pi_v<float> / 180.0f,
         static_cast<float>(width) / static_cast<float>(height),
@@ -607,7 +653,9 @@ int main(int argc, char** argv)
     bool succeeded = output_path || window.running;
     if (!succeeded)
     {
-        std::cerr << application_name << ": could not open window\n";
+        std::fprintf(stderr,
+                     "%s: could not open window\n",
+                     application_name);
     }
 
     std::uint64_t frame_index = 0;
@@ -621,22 +669,22 @@ int main(int argc, char** argv)
             const Matrix mvp = multiply(projection, multiply(view, model));
             const CubeRootArguments root{
                 .vertices = vertex_memory.gpu,
-                .texture_index = 0,
                 .transform = shader_matrix(mvp),
                 .depth_transform = {
-                    -projection.element[2][2],
-                    projection.element[3][2],
+                    .x = -projection.element[2][2],
+                    .y = projection.element[3][2],
                 },
+                .texture_index = 0,
             };
 
             render_frame(device,
                          pipeline,
                          target,
                          depth,
-                         gfx::gpu_range(resource_heap),
-                         gfx::gpu_range(sampler_heap),
+                         resource_heap_range,
+                         sampler_heap_range,
                          root,
-                         readback);
+                         readback_range);
 
             const std::byte* pixels = readback.cpu;
             if (output_path)
@@ -644,7 +692,7 @@ int main(int argc, char** argv)
                 succeeded = write_bgra8_ppm(
                     application_name, output_path, pixels, width, height);
                 if (succeeded)
-                    std::cout << "Wrote " << output_path << '\n';
+                    std::printf("Wrote %s\n", output_path);
                 break;
             }
             succeeded = present_bgra8(window, pixels, width, height);

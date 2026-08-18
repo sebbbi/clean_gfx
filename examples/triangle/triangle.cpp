@@ -3,9 +3,8 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
-#include <iostream>
+#include <cstdio>
 #include <thread>
-#include <vector>
 
 int main(int argc, char** argv)
 {
@@ -13,11 +12,11 @@ int main(int argc, char** argv)
     constexpr std::uint32_t width = 512;
     constexpr std::uint32_t height = 512;
 
-    const std::vector<std::uint32_t> vertex_spirv =
+    const ShaderCode vertex_spirv =
         read_spirv(application, CLEAN_GFX_VERTEX_SPV_PATH);
-    const std::vector<std::uint32_t> fragment_spirv =
+    const ShaderCode fragment_spirv =
         read_spirv(application, CLEAN_GFX_FRAGMENT_SPV_PATH);
-    if (vertex_spirv.empty() || fragment_spirv.empty())
+    if (vertex_spirv.size == 0 || fragment_spirv.size == 0)
         return 1;
 
     const gfx::DeviceInit device_init = gfx::create_device({
@@ -25,21 +24,21 @@ int main(int argc, char** argv)
     });
     if (device_init.error != gfx::Error::none)
     {
-        std::cerr << application << ": create device: "
-                  << gfx_error_name(device_init.error) << '\n';
+        std::fprintf(stderr,
+                     "%s: create device: %s\n",
+                     application,
+                     gfx_error_name(device_init.error));
         return 1;
     }
     gfx::Device* device = device_init.device;
-    const gfx::DeviceCaps caps = gfx::get_device_caps(device);
-    std::cout << "Using " << caps.device_name << '\n';
+    const gfx::DeviceCaps& caps = gfx::get_device_caps(device);
+    std::printf("Using %s\n", caps.device_name);
 
     gfx::Texture* target = gfx::create_texture(
         device,
         {
             .width = width,
             .height = height,
-            .depth = 1,
-            .mip_levels = 1,
             .format = gfx::Format::bgra8_srgb,
             .usage = gfx::TextureUsage::color_attachment |
                      gfx::TextureUsage::transfer_source,
@@ -53,16 +52,19 @@ int main(int argc, char** argv)
     gfx::Pipeline* pipeline = gfx::create_graphics_pipeline(
         device,
         {
-            .vertex_spirv = vertex_spirv,
-            .fragment_spirv = fragment_spirv,
+            .vertex_spirv = gfx::Span<const std::uint32_t>{
+                vertex_spirv.words.data(), vertex_spirv.size},
+            .fragment_spirv = gfx::Span<const std::uint32_t>{
+                fragment_spirv.words.data(), fragment_spirv.size},
             .color_format = gfx::Format::bgra8_srgb,
-            .depth_enabled = false,
-            .topology = gfx::PrimitiveTopology::triangle_list,
             .cull = gfx::CullMode::counter_clockwise,
         });
 
     gfx::CommandList* commands = gfx::begin_commands(device);
-    gfx::begin_rendering(commands, target, {0.01f, 0.01f, 0.033f, 1.0f});
+    gfx::begin_rendering(
+        commands,
+        target,
+        {.x = 0.01f, .y = 0.01f, .z = 0.033f, .w = 1.0f});
     gfx::bind_pipeline(commands, pipeline);
     gfx::draw(commands, nullptr, 3);
     gfx::end_rendering(commands);
@@ -88,7 +90,7 @@ int main(int argc, char** argv)
             open_example_window("clean_gfx triangle", width, height);
         if (!window.running)
         {
-            std::cerr << application << ": could not open window\n";
+            std::fprintf(stderr, "%s: could not open window\n", application);
             succeeded = false;
         }
         else
@@ -98,7 +100,9 @@ int main(int argc, char** argv)
             {
                 if (!present_bgra8(window, pixels, width, height))
                 {
-                    std::cerr << application << ": could not present image\n";
+                    std::fprintf(stderr,
+                                 "%s: could not present image\n",
+                                 application);
                     succeeded = false;
                     break;
                 }
@@ -113,7 +117,7 @@ int main(int argc, char** argv)
         const char* output_path = argc > 1 ? argv[1] : "clean_gfx_triangle.ppm";
         succeeded = write_bgra8_ppm(application, output_path, pixels, width, height);
         if (succeeded)
-            std::cout << "Wrote " << output_path << '\n';
+            std::printf("Wrote %s\n", output_path);
     }
 
     gfx::destroy_pipeline(pipeline);

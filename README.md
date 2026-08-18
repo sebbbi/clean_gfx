@@ -16,12 +16,13 @@ The implementation deliberately creates no `VkDescriptorSetLayout`, `VkDescripto
 - Vulkan 1.4 dynamic rendering and synchronization2 for the remaining fixed-function work.
 
 There is no public buffer object or owning memory class. `gpu_malloc<T>()` returns the plain
-`GpuAllocation<T> {cpu, gpu, size}` POD. Its default `MemoryType::default_` is strictly
+`GpuAllocation<T> {cpu, gpu, size}` aggregate. Its default `MemoryType::default_` is strictly
 device-local, host-visible, and host-coherent, so ordinary GPU allocations expose both a
 persistently mapped CPU pointer and their GPU pointer. `MemoryType::readback` uses the same required
 memory properties and additionally prefers host-cached memory. `MemoryType::gpu_only` is
-non-host-visible, so its `cpu` pointer is null. `gpu_free()` takes the unchanged allocation POD.
-Address-based command APIs take the separate `GpuRange {gpu, size}` POD, and `gpu_range()` converts
+non-host-visible, so its `cpu` pointer is null. `gpu_free()` takes the unchanged allocation by
+reference. Address-based command APIs take the separate `GpuRange {gpu, size}` aggregate by
+reference, and `gpu_range()` converts
 an allocation to its full range. This lets a caller bind all or part of an allocation
 without exposing a Vulkan buffer handle. `gpu_malloc_resource_heap()` and
 `gpu_malloc_sampler_heap()` create coherent, directly writable descriptor heaps. The application
@@ -33,14 +34,24 @@ command lists are opaque raw pointer handles rather than C++ ownership wrappers.
 initialization, creation returns a handle directly and matching `destroy_*()` functions release it;
 applications destroy owned handles explicitly in reverse creation order. A submitted command list
 is consumed by `submit()` or `submit_and_wait()`; `destroy_command_list()` abandons one that was not
-submitted.
+submitted. `get_device_caps()` returns a reference into the device and does not copy the capability
+record; that reference remains valid until `destroy_device()`.
+
+CPU arrays in public descriptors use `Span<T> {data, size}`, a non-owning pointer/count view with no
+iterator or accessor layer. It constructs from a pointer and count or a C array. `Span<const T>` also
+accepts an initializer list for concise call arguments. Initializer-list storage remains alive only
+through that call, so a span backed by it must never be retained.
+
+Every public descriptor field has a useful default. Call sites use C++20 designated initializers,
+name each explicitly supplied field, and omit fields whose defaults are already correct. `Span` is
+the constructor-bearing exception because its three concise input forms are part of the API.
 
 The library is built without C++ exception handling. Programming errors and Vulkan failures after
 device creation assert and abort. `create_device()` is the one recoverable object-creation operation:
 it returns `DeviceInit {device, error}` because no device exists yet on which to report a fatal
 runtime failure. CPU allocation failure is deliberately not handled. GPU heap exhaustion is the one
 allocation-specific case: `gpu_malloc()`, `gpu_malloc_resource_heap()`, and
-`gpu_malloc_sampler_heap()` return the canonical null `GpuAllocation {nullptr, nullptr, 0}`. Test
+`gpu_malloc_sampler_heap()` return the default null `GpuAllocation {}`. Test
 `gpu` if an application wants to recover; the examples deliberately assume their tiny
 allocations succeed and perform no such checks.
 
@@ -129,7 +140,7 @@ in that case:
 ```cpp
 gfx::draw(commands, nullptr, 3);
 
-RootArguments root{vertices.gpu};
+RootArguments root{.vertices = vertices.gpu};
 gfx::draw(commands, &root, vertex_count);
 ```
 
@@ -148,7 +159,7 @@ through 3. The application writes all four sampler descriptors into those exact 
 
 ## Scope
 
-Implemented now: capability-driven device creation, POD GPU allocations and ranges, coherent
+Implemented now: capability-driven device creation, plain GPU allocation and range aggregates, coherent
 device-local mapped default/readback memory, GPU-only memory, application-owned resource/sampler heap
 allocations, sampled and storage image descriptor writers, sampler descriptor writers, explicit heap
 binding, graphics and compute pipelines with null layouts, optional CPU-root draw/dispatch calls, dynamic rendering,
@@ -196,7 +207,7 @@ populating them requires extending the copy API. The unified-layout extension de
 remove the one-time initialization out of `VK_IMAGE_LAYOUT_UNDEFINED`; clean_gfx records it lazily
 in the next command-list's batched texture-initialization dependency.
 
-Address-based command functions consume `GpuRange` PODs directly. Command recording performs no
+Address-based command functions consume `GpuRange` aggregates directly. Command recording performs no
 hidden allocation lookup or command-list lifetime retention. GPU pointers copied from root data and
 descriptor-heap contents are opaque to the backend, so all pointed-to allocations, textures,
 pipelines, heaps, and descriptor slots remain the caller's lifetime responsibility through GPU completion. Callers

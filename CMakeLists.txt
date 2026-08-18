@@ -58,7 +58,14 @@ clean_gfx_disable_exceptions(clean_gfx)
 if(MSVC)
     target_compile_options(clean_gfx PRIVATE /W4 /permissive-)
 else()
-    target_compile_options(clean_gfx PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
+    target_compile_options(clean_gfx PRIVATE
+        -Wall
+        -Wextra
+        -Wpedantic
+        -Wconversion
+        -Wshadow
+        -Wno-missing-field-initializers
+    )
 endif()
 
 if(CLEAN_GFX_BUILD_EXAMPLES)

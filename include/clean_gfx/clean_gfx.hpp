@@ -6,9 +6,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <initializer_list>
 #include <limits>
-#include <span>
-#include <string_view>
 #include <type_traits>
 
 namespace gfx
@@ -18,6 +17,32 @@ struct Device;
 struct Texture;
 struct Pipeline;
 struct CommandList;
+
+template<typename T>
+struct Span
+{
+    T* data = nullptr;
+    std::size_t size = 0;
+
+    constexpr Span() noexcept = default;
+
+    constexpr Span(T* values, std::size_t count) noexcept
+        : data(values), size(count)
+    {
+    }
+
+    template<std::size_t Count>
+    constexpr Span(T (&values)[Count]) noexcept : data(values), size(Count)
+    {
+    }
+
+    // Initializer-list storage is valid only through the containing call.
+    constexpr Span(std::initializer_list<std::remove_const_t<T>> values) noexcept
+        requires std::is_const_v<T>
+        : Span(values.begin(), values.size())
+    {
+    }
+};
 
 enum class Error : std::uint8_t
 {
@@ -37,16 +62,16 @@ enum class MemoryType : std::uint8_t
 
 struct GpuRange
 {
-    void* gpu;
-    std::uint64_t size;
+    void* gpu = nullptr;
+    std::uint64_t size = 0;
 };
 
 template<typename T = std::byte>
 struct GpuAllocation
 {
-    T* cpu;
-    T* gpu;
-    std::uint64_t size;
+    T* cpu = nullptr;
+    T* gpu = nullptr;
+    std::uint64_t size = 0;
 };
 
 enum class Format : std::uint8_t
@@ -174,17 +199,17 @@ struct DeviceDesc
 
 struct DeviceCaps
 {
-    const char* device_name;
-    std::uint32_t api_version;
-    std::uint64_t max_push_data_size;
-    std::uint64_t image_descriptor_size;
-    std::uint64_t sampler_descriptor_size;
+    const char* device_name = nullptr;
+    std::uint32_t api_version = 0;
+    std::uint64_t max_push_data_size = 0;
+    std::uint64_t image_descriptor_size = 0;
+    std::uint64_t sampler_descriptor_size = 0;
 };
 
 struct DeviceInit
 {
-    Device* device;
-    Error error;
+    Device* device = nullptr;
+    Error error = Error::none;
 };
 
 struct TextureDesc
@@ -195,7 +220,6 @@ struct TextureDesc
     std::uint32_t mip_levels = 1;
     Format format = Format::rgba8_unorm;
     TextureUsage usage = TextureUsage::sampled;
-    std::string_view name;
 };
 
 struct TextureViewDesc
@@ -215,26 +239,24 @@ struct SamplerDesc
 
 struct GraphicsPipelineDesc
 {
-    std::span<const std::uint32_t> vertex_spirv;
-    std::span<const std::uint32_t> fragment_spirv;
+    Span<const std::uint32_t> vertex_spirv = {};
+    Span<const std::uint32_t> fragment_spirv = {};
     Format color_format = Format::rgba8_unorm;
     Format depth_format = Format::d32_float;
     bool depth_enabled = false;
     bool depth_write = false;
     PrimitiveTopology topology = PrimitiveTopology::triangle_list;
     CullMode cull = CullMode::none;
-    std::string_view name;
 };
 
 struct ComputePipelineDesc
 {
-    std::span<const std::uint32_t> compute_spirv;
-    std::string_view name;
+    Span<const std::uint32_t> compute_spirv = {};
 };
 
 [[nodiscard]] DeviceInit create_device(const DeviceDesc& desc = {}) noexcept;
 void destroy_device(Device* device) noexcept;
-[[nodiscard]] DeviceCaps get_device_caps(const Device* device) noexcept;
+[[nodiscard]] const DeviceCaps& get_device_caps(const Device* device) noexcept;
 
 [[nodiscard]] GpuAllocation<> gpu_malloc(
     Device* device,
@@ -270,10 +292,10 @@ template<typename T>
     Device* device, std::uint64_t byte_count) noexcept;
 [[nodiscard]] GpuAllocation<> gpu_malloc_sampler_heap(
     Device* device, std::uint64_t byte_count) noexcept;
-void gpu_free(Device* device, GpuAllocation<> allocation) noexcept;
+void gpu_free(Device* device, const GpuAllocation<>& allocation) noexcept;
 
 template<typename T>
-void gpu_free(Device* device, GpuAllocation<T> allocation) noexcept
+void gpu_free(Device* device, const GpuAllocation<T>& allocation) noexcept
 {
     gpu_free(device, {
         .cpu = reinterpret_cast<std::byte*>(allocation.cpu),
@@ -283,7 +305,8 @@ void gpu_free(Device* device, GpuAllocation<T> allocation) noexcept
 }
 
 template<typename T>
-[[nodiscard]] constexpr GpuRange gpu_range(GpuAllocation<T> allocation) noexcept
+[[nodiscard]] constexpr GpuRange gpu_range(
+    const GpuAllocation<T>& allocation) noexcept
 {
     return {.gpu = static_cast<void*>(allocation.gpu), .size = allocation.size};
 }
@@ -291,8 +314,6 @@ template<typename T>
 [[nodiscard]] Texture* create_texture(Device* device,
                                       const TextureDesc& desc) noexcept;
 void destroy_texture(Texture* texture) noexcept;
-[[nodiscard]] std::uint32_t texture_width(const Texture* texture) noexcept;
-[[nodiscard]] std::uint32_t texture_height(const Texture* texture) noexcept;
 void write_texture_descriptor(Device* device,
                               void* cpu_destination,
                               const Texture* texture,
@@ -315,24 +336,29 @@ void submit_and_wait(Device* device, CommandList* commands) noexcept;
 void wait_idle(Device* device) noexcept;
 
 void bind_pipeline(CommandList* commands, const Pipeline* pipeline) noexcept;
-void set_resource_heap(CommandList* commands, GpuRange heap) noexcept;
-void set_sampler_heap(CommandList* commands, GpuRange heap) noexcept;
+void set_resource_heap(CommandList* commands, const GpuRange& heap) noexcept;
+void set_sampler_heap(CommandList* commands, const GpuRange& heap) noexcept;
 void begin_rendering(CommandList* commands,
                      Texture* color,
-                     float4 clear_color = {0.0f, 0.0f, 0.0f, 1.0f},
+                     const float4& clear_color = {
+                         .x = 0.0f,
+                         .y = 0.0f,
+                         .z = 0.0f,
+                         .w = 1.0f,
+                     },
                      bool clear = true,
                      Texture* depth = nullptr,
                      float clear_depth = 1.0f) noexcept;
 void end_rendering(CommandList* commands) noexcept;
 void copy_memory(CommandList* commands,
-                 GpuRange source,
-                 GpuRange destination) noexcept;
+                 const GpuRange& source,
+                 const GpuRange& destination) noexcept;
 void copy_memory_to_texture(CommandList* commands,
-                            GpuRange source,
+                            const GpuRange& source,
                             Texture* destination) noexcept;
 void copy_texture_to_memory(CommandList* commands,
                             Texture* source,
-                            GpuRange destination) noexcept;
+                            const GpuRange& destination) noexcept;
 void barrier(CommandList* commands,
              Stage before,
              Access before_access,
@@ -363,7 +389,7 @@ void draw_impl(CommandList* commands,
 void draw_indexed_impl(CommandList* commands,
                        const void* root,
                        std::size_t root_size,
-                       GpuRange indices,
+                       const GpuRange& indices,
                        IndexType type,
                        std::uint32_t index_count,
                        std::uint32_t instance_count,
@@ -373,15 +399,15 @@ void draw_indexed_impl(CommandList* commands,
 void draw_indirect_impl(CommandList* commands,
                         const void* root,
                         std::size_t root_size,
-                        GpuRange arguments,
+                        const GpuRange& arguments,
                         std::uint32_t draw_count,
                         std::uint32_t stride) noexcept;
 void draw_indexed_indirect_impl(CommandList* commands,
                                 const void* root,
                                 std::size_t root_size,
-                                GpuRange indices,
+                                const GpuRange& indices,
                                 IndexType type,
-                                GpuRange arguments,
+                                const GpuRange& arguments,
                                 std::uint32_t draw_count,
                                 std::uint32_t stride) noexcept;
 void dispatch_impl(CommandList* commands,
@@ -393,7 +419,7 @@ void dispatch_impl(CommandList* commands,
 void dispatch_indirect_impl(CommandList* commands,
                             const void* root,
                             std::size_t root_size,
-                            GpuRange arguments) noexcept;
+                            const GpuRange& arguments) noexcept;
 
 } // namespace detail
 
@@ -423,7 +449,7 @@ inline void draw(CommandList* commands,
 template<typename Root>
 void draw_indexed(CommandList* commands,
                   const Root* root,
-                  GpuRange indices,
+                  const GpuRange& indices,
                   IndexType type,
                   std::uint32_t index_count,
                   std::uint32_t instance_count = 1,
@@ -438,7 +464,7 @@ void draw_indexed(CommandList* commands,
 
 inline void draw_indexed(CommandList* commands,
                          std::nullptr_t,
-                         GpuRange indices,
+                         const GpuRange& indices,
                          IndexType type,
                          std::uint32_t index_count,
                          std::uint32_t instance_count = 1,
@@ -453,7 +479,7 @@ inline void draw_indexed(CommandList* commands,
 template<typename Root>
 void draw_indirect(CommandList* commands,
                    const Root* root,
-                   GpuRange arguments,
+                   const GpuRange& arguments,
                    std::uint32_t draw_count = 1,
                    std::uint32_t stride = 0) noexcept
 {
@@ -463,7 +489,7 @@ void draw_indirect(CommandList* commands,
 
 inline void draw_indirect(CommandList* commands,
                           std::nullptr_t,
-                          GpuRange arguments,
+                          const GpuRange& arguments,
                           std::uint32_t draw_count = 1,
                           std::uint32_t stride = 0) noexcept
 {
@@ -473,9 +499,9 @@ inline void draw_indirect(CommandList* commands,
 template<typename Root>
 void draw_indexed_indirect(CommandList* commands,
                            const Root* root,
-                           GpuRange indices,
+                           const GpuRange& indices,
                            IndexType type,
-                           GpuRange arguments,
+                           const GpuRange& arguments,
                            std::uint32_t draw_count = 1,
                            std::uint32_t stride = 0) noexcept
 {
@@ -486,9 +512,9 @@ void draw_indexed_indirect(CommandList* commands,
 
 inline void draw_indexed_indirect(CommandList* commands,
                                   std::nullptr_t,
-                                  GpuRange indices,
+                                  const GpuRange& indices,
                                   IndexType type,
-                                  GpuRange arguments,
+                                  const GpuRange& arguments,
                                   std::uint32_t draw_count = 1,
                                   std::uint32_t stride = 0) noexcept
 {
@@ -518,7 +544,7 @@ inline void dispatch(CommandList* commands,
 template<typename Root>
 void dispatch_indirect(CommandList* commands,
                        const Root* root,
-                       GpuRange arguments) noexcept
+                       const GpuRange& arguments) noexcept
 {
     detail::dispatch_indirect_impl(
         commands, root, detail::root_data_size<Root>(), arguments);
@@ -526,7 +552,7 @@ void dispatch_indirect(CommandList* commands,
 
 inline void dispatch_indirect(CommandList* commands,
                               std::nullptr_t,
-                              GpuRange arguments) noexcept
+                              const GpuRange& arguments) noexcept
 {
     detail::dispatch_indirect_impl(commands, nullptr, 0, arguments);
 }

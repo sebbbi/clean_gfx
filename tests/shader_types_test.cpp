@@ -12,15 +12,17 @@ static_assert(std::is_same_v<int32, std::int32_t>);
 static_assert(std::is_same_v<uint64, std::uint64_t>);
 static_assert(std::is_same_v<int64, std::int64_t>);
 
-constexpr float16_t half_one{0x3c00u};
-constexpr float3 floats{1.0f, 2.0f, 3.0f};
-constexpr int16_t3 narrow_ints{-1, 2, -3};
-constexpr uint4 uints{1u, 2u, 3u, 4u};
-constexpr float3x4 matrix{{
-    {1.0f, 2.0f, 3.0f, 4.0f},
-    {5.0f, 6.0f, 7.0f, 8.0f},
-    {9.0f, 10.0f, 11.0f, 12.0f},
-}};
+constexpr float16_t half_one{.bits = 0x3c00u};
+constexpr float3 floats{.x = 1.0f, .y = 2.0f, .z = 3.0f};
+constexpr int16_t3 narrow_ints{.x = -1, .y = 2, .z = -3};
+constexpr uint4 uints{.x = 1u, .y = 2u, .z = 3u, .w = 4u};
+constexpr float3x4 matrix{
+    .rows = {
+        {.x = 1.0f, .y = 2.0f, .z = 3.0f, .w = 4.0f},
+        {.x = 5.0f, .y = 6.0f, .z = 7.0f, .w = 8.0f},
+        {.x = 9.0f, .y = 10.0f, .z = 11.0f, .w = 12.0f},
+    },
+};
 
 static_assert(sizeof(float3x4) == sizeof(float4) * 3);
 static_assert(std::is_same_v<decltype(float3x4::rows), float4[3]>);
